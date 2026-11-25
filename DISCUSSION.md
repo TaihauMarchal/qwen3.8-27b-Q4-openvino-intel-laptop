@@ -1,4 +1,4 @@
-<!-- Draft for https://github.com/openvinotoolkit/openvino.genai/discussions — category "Show and tell".
+<!-- Draft for https://github.com/openvinotoolkit/openvino/discussions — category "Show and tell".
      Fill the TODO links before posting. -->
 
 **Title:** Qwen3.8-27B INT4 at 11–13 tokens/s on a laptop iGPU (Arc 140T) with MTP + prefix caching
