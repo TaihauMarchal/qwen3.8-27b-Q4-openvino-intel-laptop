@@ -29,13 +29,13 @@ What helped, beyond the upstream MTP support:
   proposed here: _TODO link issue/PR_;
 - an **adaptive draft length** (stop drafting when the draft's confidence product < 0.5): +7.8 % overall,
   +24 % on tool-call outputs;
-- an optimized non-paged GatedDeltaNet GPU kernel — _TODO link openvino PR_.
+- an optimized non-paged GatedDeltaNet GPU kernel — https://github.com/openvinotoolkit/openvino/pull/40286.
 
 Decode on this iGPU is memory-bound (the stock INT4 FC kernels reach ~95 % of the 76–80 GB/s I can measure),
 so one token per weight pass tops out around 5.5 t/s; speculative decoding is what makes a 27B usable here.
 
 Full write-up, measurements, scripts and lessons learned (memory headroom vs i915 GPU hangs, thermals,
-profiling pitfalls): _TODO link to the repository_
+profiling pitfalls): https://github.com/TaihauMarchal/qwen3.8-27b-Q4-openvino-intel-laptop
 
 Thanks to the OpenVINO and GenAI teams for MTP and the hybrid-model work — happy to share logs or run tests
 on this hardware if useful.

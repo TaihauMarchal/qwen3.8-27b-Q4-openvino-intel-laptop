@@ -109,8 +109,11 @@ generated text slightly.
   probabilities drops below 0.5. Fixed 3 tokens was the best fixed setting; adaptive adds +7.8 % overall:
   tool-call outputs (very predictable) 10.45 → 12.94 t/s (+24 %), prose 10.29 → 10.08 t/s (−2 %).
 - **Optimized GatedDeltaNet GPU kernel** (non-paged / stateful path): GDN time per decode step
-  **9.62 → 5.29 ms** (48 layers), full decode step median 254.2 → 245.2 ms (−3.5 %).
-  Upstream PR: _link to the openvino PR "[GPU] Add optimized GatedDeltaNet kernel" — TODO_.
+  **9.62 → 5.29 ms** (48 layers), full decode step median 254.2 → 245.2 ms (−3.5 %, research build on 2026.4.1,
+  together with the permute kernel below).
+  Upstream PR: [openvinotoolkit/openvino#40286](https://github.com/openvinotoolkit/openvino/pull/40286) — rewritten
+  on master and limited to single-token decode, where it wins: **1.4× on the kernel** (0.128 → 0.092 ms per call,
+  Qwen3.8 linear-attention shape), under 1 % of a 27B decode step.
 - **Dynamic-shape f↔y permute kernel** replacing the reference permute: transposes in a 512-token prefill
   chunk 78.2 → 37.2 ms.
 - **Non-finite-logits guard**: one generation out of 111 in one configuration produced NaN logits (cause not
@@ -213,7 +216,7 @@ variables instead of properties, debug hooks). Focused upstream PRs are being pr
 ## Links
 
 - OpenVINO: https://github.com/openvinotoolkit/openvino — OpenVINO GenAI: https://github.com/openvinotoolkit/openvino.genai
-- My upstream contributions: _GatedDeltaNet kernel PR — TODO_ · _draft vocabulary subset issue/PR — TODO_
+- My upstream contributions: [GatedDeltaNet kernel PR #40286](https://github.com/openvinotoolkit/openvino/pull/40286) · _draft vocabulary subset issue/PR — TODO_
 - Discussion: _openvino.genai Show and tell — TODO_
 
 ## License
