@@ -1,0 +1,777 @@
+# qwen38-gpu-kernels: OpenVINO 2026.4.1 (e213a147257) GPU-plugin delta for Qwen3.8 on Arc 140T (own work, WITHOUT the long-context backport)
+#   - gated_delta_net opt kernel + permute_f_y_swap_dyn (stateful/non-paged path)
+#   - FullyConnected: no fake row alignment for <= 8 rows with int4/int8 compressed weights (OV_GPU_FC_NO_ALIGN_MAX_ROWS, default 8, 0 = stock)
+#   - DynamicQuantize: OV_GPU_DQ_THRESHOLD env override of the internal dynamic_quantization_threshold (unset = stock 64)
+# apply: git -C <openvino @ 2026.4.1> apply qwen38-gpu-kernels.patch ; build target openvino_intel_gpu_plugin
+# generated 2026-11-14T04:18:35-10:00 ; see ~/src/gpu-max/STATE.md
+diff --git a/src/plugins/intel_gpu/src/graph/dynamic_quantize.cpp b/src/plugins/intel_gpu/src/graph/dynamic_quantize.cpp
+index 4fd8a86c..f5838264 100644
+--- a/src/plugins/intel_gpu/src/graph/dynamic_quantize.cpp
++++ b/src/plugins/intel_gpu/src/graph/dynamic_quantize.cpp
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: Apache-2.0
+ //
+ 
++#include <cstdlib>
+ #include "ov_ops/dynamic_quantize.hpp"
+ #include "dynamic_quantize_inst.h"
+ #include "fully_connected_inst.h"
+@@ -37,6 +38,18 @@ static bool should_skip_execution(const dynamic_quantize_node& node, const layou
+         input_batch = act_layout.batch() * act_layout.feature();
+     }
+ 
++    // OV_GPU_DQ_THRESHOLD overrides dynamic_quantization_threshold (a release-internal option, not settable through
++    // compile_model properties; default 64 = activations stay f16 for <= 64 token rows). With 1, the K+1-row passes of
++    // speculative (MTP) decoding use i8 activations while single-token decode keeps f16; 0 quantizes every pass.
++    // Measured on Arc 140T / Qwen3.8-27B, 4-row verify pass: FC kernel time -11.5 % (215.9 -> 191.0 ms). It changes
++    // numerics (activation quantization noise), hence opt-in.
++    static const long env_threshold = []() -> long {
++        const char* env = std::getenv("OV_GPU_DQ_THRESHOLD");
++        return env ? std::strtol(env, nullptr, 10) : -1;
++    }();
++    if (env_threshold >= 0)
++        return static_cast<size_t>(env_threshold) >= input_batch;
++
+     if (node.get_program().get_config().get_dynamic_quantization_threshold() >= input_batch) {
+         GPU_DEBUG_TRACE << node.id() << "  dyn_quan is turned off: input batch size is too small - " << input_batch << " / "
+                         << node.get_program().get_config().get_dynamic_quantization_threshold() << std::endl;
+diff --git a/src/plugins/intel_gpu/src/graph/fully_connected.cpp b/src/plugins/intel_gpu/src/graph/fully_connected.cpp
+index 21d843e5..33440bc1 100644
+--- a/src/plugins/intel_gpu/src/graph/fully_connected.cpp
++++ b/src/plugins/intel_gpu/src/graph/fully_connected.cpp
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: Apache-2.0
+ //
+ #include "fully_connected_inst.h"
++#include <cstdlib>
+ #include "primitive_type_base.h"
+ #include "json_object.h"
+ #include <string>
+@@ -320,6 +321,25 @@ kernel_impl_params fully_connected_inst::get_fake_aligned_params(kernel_impl_par
+             return std::move(orig_impl_param);
+         }
+ 
++        // LLM speculative-verify passes run a handful of token rows (K+1 <= 8) against int4/int8 compressed weights.
++        // Such an FC is memory-bound: the whole weight matrix is streamed once whatever the row count, so padding
++        // 2..8 rows up to 16 only adds arithmetic per streamed weight byte. Measured on Arc 140T / Qwen3.8-27B, 4 rows:
++        // with i8 (dynamically quantized) activations the padded gemm costs +13 % FC time (215.6 vs 190.6 ms per pass);
++        // with f16 activations (dynamic quantization skipped below its threshold) it makes no measurable difference.
++        // Padding rows are discarded: logits are bit-identical with f16 activations (rounding-level differences with i8).
++        // OV_GPU_FC_NO_ALIGN_MAX_ROWS=0 restores the stock behaviour.
++        {
++            static const size_t no_align_max_rows = []() -> size_t {
++                const char* env = std::getenv("OV_GPU_FC_NO_ALIGN_MAX_ROWS");
++                return env ? static_cast<size_t>(std::strtoul(env, nullptr, 10)) : 8;
++            }();
++            const auto wdt = orig_impl_param.weights_layout.value().data_type;
++            const bool is_compressed_int = one_of(wdt, {data_types::i4, data_types::u4, data_types::i8, data_types::u8});
++            if (is_compressed_int && batch_size <= no_align_max_rows && input_shape.back() >= 1024) {
++                return std::move(orig_impl_param);
++            }
++        }
++
+         size_t fake_align_base = 8;
+         if (orig_impl_param.dev_type == cldnn::device_type::integrated_gpu) {
+             auto weights_layout_dt = orig_impl_param.weights_layout.value().data_type;
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/gated_delta_net_opt.cl b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/gated_delta_net_opt.cl
+new file mode 100644
+index 00000000..0abec0c2
+--- /dev/null
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/gated_delta_net_opt.cl
+@@ -0,0 +1,150 @@
++// Copyright (C) 2018-2026 Intel Corporation
++// SPDX-License-Identifier: Apache-2.0
++//
++
++#include "include/batch_headers/common.cl"
++
++// GatedDeltaNet (stateful, non-paged) kernel for short sequences (decode, seq_len <= 4, chosen on the host),
++// recurrent state layout [B, H, K, V] (V innermost). Longer sequences (prefill) use gated_delta_net_ref.cl.
++//
++// One sub-group (= one work-group) per (batch, v-head, tile of SUBGROUP_SIZE V-columns); lane -> one V column.
++// The state is streamed, not kept in registers:
++//   pass 1: h_k = exp(g) * sum_k S[k][v] * k[k]           (coalesced row reads, no cross-lane reduction needed)
++//   pass 2: S'[k][v] = exp(g) * S[k][v] + k[k] * u[v],  u = (v - h_k) * beta
++//           o[v] = sum_k S'[k][v] * q[k]                  (S' written back, second read hits the cache)
++// No SLM, no barriers, and every sub-group is independent, so a decode step is not limited by the sequential latency
++// of the reference kernel (scalar loads strided by V, 2 sub-group reductions per V column per token).
++// q/k are read once per token, one element per lane per 16-row chunk, and broadcast with sub_group_broadcast.
++// Math is identical to gated_delta_net_ref.cl (fp32 accumulation); one partial sum per 16-row chunk keeps the
++// FMA dependency chains short.
++
++#define K_CHUNKS (K_HEAD_DIM / SUBGROUP_SIZE)
++
++REQD_SUB_GROUP_SIZE(SUBGROUP_SIZE)
++__attribute__((reqd_work_group_size(1, 1, SUBGROUP_SIZE)))
++KERNEL(gated_delta_net_opt)
++(__global INPUT0_TYPE* q,
++ __global INPUT1_TYPE* k,
++ __global INPUT2_TYPE* v,
++ __global INPUT3_TYPE* initial_state,
++ __global INPUT4_TYPE* g,
++ __global INPUT5_TYPE* beta,
++ __global OUTPUT_TYPE* output,
++#if OUTPUT_STATE
++ __global OUTPUT1_TYPE* output_state,
++#endif
++ int seq_len,
++ int query_offset,
++ int key_offset,
++ int value_offset,
++ int q_t_stride,
++ int k_t_stride,
++ int v_t_stride) {
++    const int T_len = seq_len;
++    const int H_len = V_HEAD_NUM;
++    const int b = get_group_id(0) / V_HEAD_NUM;
++    const int h = get_group_id(0) % V_HEAD_NUM;
++    const int lane = get_sub_group_local_id();
++    const int iv = get_group_id(1) * SUBGROUP_SIZE + lane;
++
++    const int group_size = V_HEAD_NUM / K_HEAD_NUM;
++    const int hk = h / group_size;
++
++    const int Q_B_STRIDE = T_len * q_t_stride;
++    const int K_B_STRIDE = T_len * k_t_stride;
++    const int V_B_STRIDE = T_len * v_t_stride;
++    const int STATE_BASE = (b * H_len + h) * (K_HEAD_DIM * V_HEAD_DIM) + iv;
++    const int out_bh_base = b * T_len * H_len * V_HEAD_DIM + h * V_HEAD_DIM + iv;
++
++#if OUTPUT_STATE
++    __global OUTPUT1_TYPE* dst = output_state + STATE_BASE;
++    const __global INPUT3_TYPE* src0 = initial_state + STATE_BASE;
++    // Token t > 0 continues from the state written by token t - 1 (same work-item, so the writes are visible).
++#    define LOAD_STATE(row) (t == 0 ? convert_float(src0[(row) * V_HEAD_DIM]) : convert_float(dst[(row) * V_HEAD_DIM]))
++#    define STORE_STATE(row, val) dst[(row) * V_HEAD_DIM] = (OUTPUT1_TYPE)(val)
++#else
++    __global INPUT3_TYPE* dst = initial_state + STATE_BASE;
++#    define LOAD_STATE(row) convert_float(dst[(row) * V_HEAD_DIM])
++#    define STORE_STATE(row, val) dst[(row) * V_HEAD_DIM] = (INPUT3_TYPE)(val)
++#endif
++
++    for (int t = 0; t < T_len; t++) {
++        const int g_idx = (b * T_len + t) * H_len + h;
++        const float b_g = exp(convert_float(g[g_idx]));
++        const float b_beta = convert_float(beta[g_idx]);
++
++        const int q_offset = b * Q_B_STRIDE + t * q_t_stride + (hk + query_offset) * K_HEAD_DIM;
++        const int k_offset = b * K_B_STRIDE + t * k_t_stride + (hk + key_offset) * K_HEAD_DIM;
++        const int v_offset = b * V_B_STRIDE + t * v_t_stride + (h + value_offset) * V_HEAD_DIM;
++
++        // q/k: element (c * SUBGROUP_SIZE + lane) is held by this lane.
++        float k_l[K_CHUNKS];
++        float q_l[K_CHUNKS];
++        float q_sum = 0.0f;
++        float k_sum = 0.0f;
++        __attribute__((opencl_unroll_hint))
++        for (int c = 0; c < K_CHUNKS; c++) {
++            k_l[c] = convert_float(k[k_offset + c * SUBGROUP_SIZE + lane]);
++            q_l[c] = convert_float(q[q_offset + c * SUBGROUP_SIZE + lane]);
++            k_sum = fma(k_l[c], k_l[c], k_sum);
++            q_sum = fma(q_l[c], q_l[c], q_sum);
++        }
++#if FUSE_QK_L2NORM
++        const float k_scale = rsqrt(sub_group_reduce_add(k_sum) + K_L2_NORM_EPS);
++        const float q_scale = rsqrt(sub_group_reduce_add(q_sum) + Q_L2_NORM_EPS) * SCALE_FACTOR;
++#else
++        const float k_scale = 1.0f;
++        const float q_scale = SCALE_FACTOR;
++#endif
++        __attribute__((opencl_unroll_hint))
++        for (int c = 0; c < K_CHUNKS; c++) {
++            k_l[c] *= k_scale;
++            q_l[c] *= q_scale;
++        }
++        const float b_v = convert_float(v[v_offset + iv]);
++
++        // pass 1: h_k = exp(g) * S^T k
++        float hk_c[K_CHUNKS];
++        __attribute__((opencl_unroll_hint))
++        for (int c = 0; c < K_CHUNKS; c++) {
++            float acc = 0.0f;
++            __attribute__((opencl_unroll_hint))
++            for (int i = 0; i < SUBGROUP_SIZE; i++) {
++                acc = fma(LOAD_STATE(c * SUBGROUP_SIZE + i), sub_group_broadcast(k_l[c], i), acc);
++            }
++            hk_c[c] = acc;
++        }
++        float h_k = 0.0f;
++        __attribute__((opencl_unroll_hint))
++        for (int c = 0; c < K_CHUNKS; c++) {
++            h_k += hk_c[c];
++        }
++        h_k *= b_g;
++        const float update_val = (b_v - h_k) * b_beta;
++
++        // pass 2: S' = exp(g) * S + k u^T,  o = S'^T q
++        float o_c[K_CHUNKS];
++        __attribute__((opencl_unroll_hint))
++        for (int c = 0; c < K_CHUNKS; c++) {
++            float acc = 0.0f;
++            __attribute__((opencl_unroll_hint))
++            for (int i = 0; i < SUBGROUP_SIZE; i++) {
++                const int row = c * SUBGROUP_SIZE + i;
++                const float s = fma(sub_group_broadcast(k_l[c], i), update_val, LOAD_STATE(row) * b_g);
++                STORE_STATE(row, s);
++                acc = fma(s, sub_group_broadcast(q_l[c], i), acc);
++            }
++            o_c[c] = acc;
++        }
++        float o = 0.0f;
++        __attribute__((opencl_unroll_hint))
++        for (int c = 0; c < K_CHUNKS; c++) {
++            o += o_c[c];
++        }
++        output[out_bh_base + t * H_len * V_HEAD_DIM] = TO_OUTPUT_TYPE(o);
++    }
++#undef LOAD_STATE
++#undef STORE_STATE
++}
++
++#undef K_CHUNKS
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/gated_delta_net_opt.hpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/gated_delta_net_opt.hpp
+new file mode 100644
+index 00000000..00c211a2
+--- /dev/null
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/gated_delta_net_opt.hpp
+@@ -0,0 +1,78 @@
++// Copyright (C) 2018-2026 Intel Corporation
++// SPDX-License-Identifier: Apache-2.0
++//
++
++#pragma once
++
++#include <array>
++#include <memory>
++#include <utility>
++
++#include "gated_delta_net_inst.h"
++#include "program_node.h"
++#include "registry/implementation_manager.hpp"
++
++using namespace cldnn;  // TODO: Remove once namespaces are aligned
++
++namespace ov::intel_gpu::ocl {
++
++// GatedDeltaNet for the stateful (non-paged) op, recurrent state laid out as [B, H, K, V] (V innermost).
++// Two stages chosen at runtime from the sequence length (see gated_delta_net_ref.cpp):
++//  - seq_len <= max_decode_seq_len: gated_delta_net_opt.cl, one independent sub-group per (b, h, 16 V-columns),
++//    state streamed with coalesced row accesses (no SLM / barriers / cross-lane reductions). The reference kernel
++//    assigns 8 K-rows x 4 V-columns per lane, i.e. scalar loads strided by V plus 2 sub-group reductions per column.
++//  - longer sequences (prefill): the reference kernel (state kept in registers across tokens).
++struct GatedDeltaNetOpt : public ImplementationManager {
++    OV_GPU_PRIMITIVE_IMPL("ocl::gated_delta_net::opt")
++    explicit GatedDeltaNetOpt(shape_types shape_type, ValidateFunc vf = nullptr) : ImplementationManager(impl_types::ocl, shape_type, std::move(vf)) {}
++    [[nodiscard]] std::unique_ptr<primitive_impl> create_impl(const program_node& node, const RuntimeParams& params) const override;
++
++    static constexpr size_t subgroup_size = 16;
++    static constexpr int64_t max_decode_seq_len = 4;
++
++    [[nodiscard]] bool validate_impl(const program_node& node) const override {
++        assert(node.is_type<gated_delta_net>());
++        static constexpr std::array supported_fmts = {
++            format::bfyx,
++        };
++
++        static constexpr std::array supported_types = {
++            ov::element::f16,
++            ov::element::f32,
++        };
++
++        for (size_t i = 0; i < node.get_dependencies().size(); i++) {
++            const auto& in_layout = node.get_input_layout(i);
++            if (!one_of(in_layout.format, supported_fmts) || !one_of(in_layout.data_type, supported_types)) {
++                return false;
++            }
++        }
++        for (size_t i = 0; i < node.get_outputs_count(); i++) {
++            const auto& out_layout = node.get_output_layout(i);
++            if (!one_of(out_layout.format, supported_fmts) || !one_of(out_layout.data_type, supported_types)) {
++                return false;
++            }
++        }
++
++        const auto& info = node.get_program().get_engine().get_device_info();
++        if (!one_of(subgroup_size, info.supported_simd_sizes)) {
++            return false;
++        }
++
++        // Head counts / head sizes must be static: they are baked into the kernel as JIT constants.
++        const auto& q_shape = node.get_input_layout(0).get_partial_shape();
++        const auto& v_shape = node.get_input_layout(2).get_partial_shape();
++        if (q_shape.rank().is_dynamic() || v_shape.rank().is_dynamic() || q_shape.rank().get_length() != 4 || v_shape.rank().get_length() != 4 ||
++            q_shape[2].is_dynamic() || q_shape[3].is_dynamic() || v_shape[2].is_dynamic() || v_shape[3].is_dynamic()) {
++            return false;
++        }
++        const auto k_head_dims = static_cast<size_t>(q_shape[3].get_length());
++        const auto v_head_dims = static_cast<size_t>(v_shape[3].get_length());
++        const auto k_heads = static_cast<size_t>(q_shape[2].get_length());
++        const auto v_heads = static_cast<size_t>(v_shape[2].get_length());
++        // Prefill stage = reference kernel: keep the reference constraints too (its fast path needs K == 128).
++        return k_head_dims % subgroup_size == 0 && k_head_dims <= 256 && v_head_dims % subgroup_size == 0 && k_heads > 0 && v_heads % k_heads == 0;
++    }
++};
++
++}  // namespace ov::intel_gpu::ocl
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/gated_delta_net_ref.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/gated_delta_net_ref.cpp
+index f9541717..ca71716c 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/gated_delta_net_ref.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/gated_delta_net_ref.cpp
+@@ -3,6 +3,7 @@
+ //
+ 
+ #include "gated_delta_net_ref.hpp"
++#include "gated_delta_net_opt.hpp"
+ 
+ #include "intel_gpu/primitives/gated_delta_net.hpp"
+ #include "primitive_ocl_base.hpp"
+@@ -28,9 +29,54 @@ size_t get_subgroup_size(gpu_arch arch) {
+     }
+ }
+ 
++
++// Kernel scalars shared by the ref and opt kernels: seq_len, q/k/v head offsets (lower padding of the head axis, e.g.
++// VariadicSplit crops) and q/k/v token strides.
++void set_scalars(const RuntimeParams& params, KernelData& kd) {
++    const auto& q_shape = params.get_input_layout(0).get_partial_shape();
++    const auto& v_shape = params.get_input_layout(2).get_partial_shape();
++    const size_t seq_len = q_shape[1].get_length();
++
++    auto get_head_offset = [](const cldnn::layout& layout) {
++        const auto& lower_pads = layout.data_padding._lower_size;
++        return lower_pads.size() > 2 ? lower_pads[2] : 0;
++    };
++
++    const auto& q_pitches = params.input_layouts[0].get_pitches();
++    const auto& k_pitches = params.input_layouts[1].get_pitches();
++    const auto& v_pitches = params.input_layouts[2].get_pitches();
++
++    size_t query_offset = get_head_offset(params.input_layouts[0]);
++    size_t key_offset = get_head_offset(params.input_layouts[1]);
++    size_t value_offset = get_head_offset(params.input_layouts[2]);
++
++    const int32_t q_t_stride =
++        q_pitches.size() > 1 ? static_cast<int32_t>(q_pitches[1]) : static_cast<int32_t>(q_shape[2].get_length() * q_shape[3].get_length());
++    const int32_t k_t_stride =
++        k_pitches.size() > 1 ? static_cast<int32_t>(k_pitches[1]) : static_cast<int32_t>(q_shape[2].get_length() * q_shape[3].get_length());
++    const int32_t v_t_stride =
++        v_pitches.size() > 1 ? static_cast<int32_t>(v_pitches[1]) : static_cast<int32_t>(v_shape[2].get_length() * v_shape[3].get_length());
++
++    kd.params.scalars.clear();
++    std::vector<int32_t> scalars{static_cast<int32_t>(seq_len),
++                                 static_cast<int32_t>(query_offset),
++                                 static_cast<int32_t>(key_offset),
++                                 static_cast<int32_t>(value_offset),
++                                 q_t_stride,
++                                 k_t_stride,
++                                 v_t_stride};
++    for (auto i : scalars) {
++        scalar_desc desc;
++        desc.t = scalar_desc::Types::INT32;
++        desc.v.s32 = static_cast<int32_t>(i);
++        kd.params.scalars.push_back(desc);
++    }
++}
++
+ class GatedDeltaNetRefGenerator : public KernelGenerator {
+ public:
+     GatedDeltaNetRefGenerator() : KernelGenerator("gated_delta_net_ref") {}
++    explicit GatedDeltaNetRefGenerator(std::string_view name) : KernelGenerator(name) {}
+ 
+ protected:
+     [[nodiscard]] JitConstants get_jit_constants(const RuntimeParams& params) const override {
+@@ -89,49 +135,15 @@ protected:
+             const auto& q_shape = params.get_input_layout(0).get_partial_shape();
+             const auto& v_shape = params.get_input_layout(2).get_partial_shape();
+             const size_t batch = q_shape[0].get_length();
+-            const size_t seq_len = q_shape[1].get_length();
+             const size_t head_nums = v_shape[2].get_length();
+             const size_t v_head_dims = v_shape[3].get_length();
+             const size_t v_blocks = (v_head_dims + v_block_size - 1) / v_block_size;
+             const size_t subgroup_size = get_subgroup_size(params.get_device_info().arch);
+ 
+-            auto get_head_offset = [](const cldnn::layout& layout) {
+-                const auto& lower_pads = layout.data_padding._lower_size;
+-                return lower_pads.size() > 2 ? lower_pads[2] : 0;
+-            };
+-
+-            const auto& q_pitches = params.input_layouts[0].get_pitches();
+-            const auto& k_pitches = params.input_layouts[1].get_pitches();
+-            const auto& v_pitches = params.input_layouts[2].get_pitches();
+-
+-            size_t query_offset = get_head_offset(params.input_layouts[0]);
+-            size_t key_offset = get_head_offset(params.input_layouts[1]);
+-            size_t value_offset = get_head_offset(params.input_layouts[2]);
+-
+-            const int32_t q_t_stride =
+-                q_pitches.size() > 1 ? static_cast<int32_t>(q_pitches[1]) : static_cast<int32_t>(q_shape[2].get_length() * q_shape[3].get_length());
+-            const int32_t k_t_stride =
+-                k_pitches.size() > 1 ? static_cast<int32_t>(k_pitches[1]) : static_cast<int32_t>(q_shape[2].get_length() * q_shape[3].get_length());
+-            const int32_t v_t_stride =
+-                v_pitches.size() > 1 ? static_cast<int32_t>(v_pitches[1]) : static_cast<int32_t>(v_shape[2].get_length() * v_shape[3].get_length());
+-
+             wgs.global = {batch, head_nums, v_blocks * subgroup_size};
+             wgs.local = {1, 1, subgroup_size};
+ 
+-            kd.params.scalars.clear();
+-            std::vector<int32_t> scalars{static_cast<int32_t>(seq_len),
+-                                         static_cast<int32_t>(query_offset),
+-                                         static_cast<int32_t>(key_offset),
+-                                         static_cast<int32_t>(value_offset),
+-                                         q_t_stride,
+-                                         k_t_stride,
+-                                         v_t_stride};
+-            for (auto i : scalars) {
+-                scalar_desc desc;
+-                desc.t = scalar_desc::Types::INT32;
+-                desc.v.s32 = static_cast<int32_t>(i);
+-                kd.params.scalars.push_back(desc);
+-            }
++            set_scalars(params, kd);
+         }};
+     }
+ };
+@@ -152,6 +164,64 @@ public:
+     }
+ };
+ 
++
++// Decode-stage generator (gated_delta_net_opt.cl): same JIT constants and arguments as the ref kernel, one sub-group
++// of 16 lanes per (batch, v-head, 16 V-columns).
++class GatedDeltaNetOptGenerator : public GatedDeltaNetRefGenerator {
++public:
++    GatedDeltaNetOptGenerator() : GatedDeltaNetRefGenerator("gated_delta_net_opt") {}
++
++protected:
++    [[nodiscard]] JitConstants get_jit_constants(const RuntimeParams& params) const override {
++        auto jit = GatedDeltaNetRefGenerator::get_jit_constants(params);
++        jit.remove("SUBGROUP_SIZE");
++        jit.make("SUBGROUP_SIZE", GatedDeltaNetOpt::subgroup_size);
++        return jit;
++    }
++
++    [[nodiscard]] DispatchDataFunc get_dispatch_data_func() const override {
++        return DispatchDataFunc{[](const RuntimeParams& params, KernelData& kd, ImplRuntimeParams* rt_params) {
++            assert(!params.is_dynamic());
++            auto& wgs = kd.params.workGroups;
++            const auto& q_shape = params.get_input_layout(0).get_partial_shape();
++            const auto& v_shape = params.get_input_layout(2).get_partial_shape();
++            const size_t batch = q_shape[0].get_length();
++            const size_t head_nums = v_shape[2].get_length();
++            const size_t v_head_dims = v_shape[3].get_length();
++            const size_t sg = GatedDeltaNetOpt::subgroup_size;
++            wgs.global = {batch * head_nums, v_head_dims / sg, sg};
++            wgs.local = {1, 1, sg};
++            set_scalars(params, kd);
++        }};
++    }
++};
++
++class GatedDeltaNetOptImpl : public PrimitiveImplOCL {
++public:
++    DECLARE_OBJECT_TYPE_SERIALIZATION(ov::intel_gpu::ocl::GatedDeltaNetOptImpl)
++
++    Stage::Ptr decode_stage = make_stage<GatedDeltaNetOptGenerator>();
++    Stage::Ptr prefill_stage = make_stage<GatedDeltaNetRefGenerator>();
++
++    GatedDeltaNetOptImpl() : PrimitiveImplOCL(GatedDeltaNetOpt::get_type_info_static()) {}
++    GatedDeltaNetOptImpl(const program_node& node, const RuntimeParams& params) : GatedDeltaNetOptImpl() {
++        add_stage(decode_stage, params);
++        add_stage(prefill_stage, params);
++    }
++
++    [[nodiscard]] std::unique_ptr<primitive_impl> clone() const override {
++        return make_deep_copy<GatedDeltaNetOptImpl>(this);
++    }
++
++    // Stage 0 (streaming opt kernel) for decode / short chunks, stage 1 (ref kernel) for prefill.
++    [[nodiscard]] std::vector<size_t> get_stages_execution_order(const RuntimeParams& params) const override {
++        const auto& q_shape = params.get_input_layout(0).get_partial_shape();
++        if (q_shape.rank().is_static() && q_shape[1].is_static() && q_shape[1].get_length() <= GatedDeltaNetOpt::max_decode_seq_len)
++            return {0};
++        return {1};
++    }
++};
++
+ }  // namespace
+ 
+ std::unique_ptr<primitive_impl> GatedDeltaNetRef::create_impl(const program_node& node, const RuntimeParams& params) const {
+@@ -159,7 +229,13 @@ std::unique_ptr<primitive_impl> GatedDeltaNetRef::create_impl(const program_node
+     return std::make_unique<GatedDeltaNetRefImpl>(node, params);
+ }
+ 
++std::unique_ptr<primitive_impl> GatedDeltaNetOpt::create_impl(const program_node& node, const RuntimeParams& params) const {
++    assert(node.is_type<gated_delta_net>());
++    return std::make_unique<GatedDeltaNetOptImpl>(node, params);
++}
++
+ }  // namespace ov::intel_gpu::ocl
+ 
+ BIND_BINARY_BUFFER_WITH_TYPE(cldnn::gated_delta_net)
+ BIND_BINARY_BUFFER_WITH_TYPE(ov::intel_gpu::ocl::GatedDeltaNetRefImpl)
++BIND_BINARY_BUFFER_WITH_TYPE(ov::intel_gpu::ocl::GatedDeltaNetOptImpl)
+diff --git a/src/plugins/intel_gpu/src/graph/registry/gated_delta_net_impls.cpp b/src/plugins/intel_gpu/src/graph/registry/gated_delta_net_impls.cpp
+index 3cab2316..36ff7de8 100644
+--- a/src/plugins/intel_gpu/src/graph/registry/gated_delta_net_impls.cpp
++++ b/src/plugins/intel_gpu/src/graph/registry/gated_delta_net_impls.cpp
+@@ -7,6 +7,7 @@
+ #include "primitive_inst.h"
+ 
+ #if OV_GPU_WITH_OCL
++    #include "impls/ocl_v2/gated_delta_net_opt.hpp"
+     #include "impls/ocl_v2/gated_delta_net_ref.hpp"
+ #endif
+ 
+@@ -17,6 +18,8 @@ using namespace cldnn;
+ const std::vector<std::shared_ptr<cldnn::ImplementationManager>>& Registry<gated_delta_net>::get_implementations() {
+     static const std::vector<std::shared_ptr<ImplementationManager>> impls = {
+ #if OV_GPU_WITH_OCL
++    // opt first: coalesced [B,H,K,V] state access, falls back to ref for unsupported head sizes
++    OV_GPU_CREATE_INSTANCE_OCL(ocl::GatedDeltaNetOpt, shape_types::any)
+     OV_GPU_CREATE_INSTANCE_OCL(ocl::GatedDeltaNetRef, shape_types::any)
+ #endif
+     };
+diff --git a/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/permute_f_y_swap_dyn.cl b/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/permute_f_y_swap_dyn.cl
+new file mode 100644
+index 00000000..bd348bdb
+--- /dev/null
++++ b/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/permute_f_y_swap_dyn.cl
+@@ -0,0 +1,74 @@
++// Copyright (C) 2018-2026 Intel Corporation
++// SPDX-License-Identifier: Apache-2.0
++//
++
++#include "include/batch_headers/fetch_data.cl"
++
++// Shape-agnostic (dynamic) Transpose that swaps feature and Y with X == 1, i.e. OV order {0,2,1} on 3D tensors
++// (or {0,2,1,3} on 4D tensors with last dim 1):
++//   out[b, f_out = y, y_out = f, 0] = in[b, f, y, 0]
++// Typical use: the [B,T,C] <-> [B,C,T] transposes around the causal conv1d of linear-attention (GatedDeltaNet)
++// blocks, where permute_ref writes with stride T (uncoalesced) and dominated the prefill time.
++//
++// A (WG_DIM x WG_DIM) work-group transposes a TILE_SIZE x TILE_SIZE block through SLM; every work-item
++// handles ELEMS_PER_DIM^2 elements. Reads are coalesced along input Y (innermost), writes along output Y
++// (innermost). Ragged edges are always guarded (shapes are only known at runtime).
++//
++// GWS: (ceil(INPUT0_SIZE_Y / TILE_SIZE) * WG_DIM, ceil(INPUT0_FEATURE_NUM / TILE_SIZE) * WG_DIM, INPUT0_BATCH_NUM)
++
++__attribute__((reqd_work_group_size(WG_DIM, WG_DIM, 1)))
++KERNEL(permute_f_y_swap_dyn)(
++    OPTIONAL_SHAPE_INFO_ARG
++    const __global INPUT0_TYPE* input,
++    __global OUTPUT_TYPE* output
++#if HAS_FUSED_OPS_DECLS
++    , FUSED_OPS_DECLS
++#endif
++)
++{
++    const uint lx = (uint)get_local_id(0);
++    const uint ly = (uint)get_local_id(1);
++    const uint ty = (uint)get_group_id(0);   // tile index along input Y
++    const uint tf = (uint)get_group_id(1);   // tile index along input F
++    const uint b  = (uint)get_global_id(2);
++
++    __local INPUT0_TYPE tile[TILE_SIZE][TILE_SIZE + 1];
++
++    // Phase 1: coalesced reads along input Y. tile[f_local][y_local]
++    __attribute__((opencl_unroll_hint))
++    for (uint df = 0; df < ELEMS_PER_DIM; ++df) {
++        const uint sub_f = ly + df * WG_DIM;
++        const uint in_f = tf * TILE_SIZE + sub_f;
++        __attribute__((opencl_unroll_hint))
++        for (uint dy = 0; dy < ELEMS_PER_DIM; ++dy) {
++            const uint sub_y = lx + dy * WG_DIM;
++            const uint in_y = ty * TILE_SIZE + sub_y;
++            if (in_f < INPUT0_FEATURE_NUM && in_y < INPUT0_SIZE_Y)
++                tile[sub_f][sub_y] = input[INPUT0_GET_INDEX(b, in_f, in_y, 0)];
++        }
++    }
++
++    barrier(CLK_LOCAL_MEM_FENCE);
++
++    // Phase 2: coalesced writes along output Y (= input F). Output tile origin: f_out = ty*TILE, y_out = tf*TILE.
++    __attribute__((opencl_unroll_hint))
++    for (uint dfo = 0; dfo < ELEMS_PER_DIM; ++dfo) {
++        const uint sub_fo = ly + dfo * WG_DIM;
++        const uint out_f = ty * TILE_SIZE + sub_fo;
++        __attribute__((opencl_unroll_hint))
++        for (uint dyo = 0; dyo < ELEMS_PER_DIM; ++dyo) {
++            const uint sub_yo = lx + dyo * WG_DIM;
++            const uint out_y = tf * TILE_SIZE + sub_yo;
++            if (out_f >= OUTPUT_FEATURE_NUM || out_y >= OUTPUT_SIZE_Y)
++                continue;
++            const INPUT0_TYPE val = tile[sub_yo][sub_fo];
++            const uint out_x = 0;
++#if HAS_FUSED_OPS
++            FUSED_OPS;
++            output[OUTPUT_GET_INDEX(b, out_f, out_y, out_x)] = FUSED_OPS_RESULT;
++#else
++            output[OUTPUT_GET_INDEX(b, out_f, out_y, out_x)] = TO_OUTPUT_TYPE(ACTIVATION(DECODE_INPUT0_COMPUTE_TYPE(val), ACTIVATION_PARAMS));
++#endif
++        }
++    }
++}
+diff --git a/src/plugins/intel_gpu/src/kernel_selector/kernels/permute/permute_kernel_f_y_swap_dyn.cpp b/src/plugins/intel_gpu/src/kernel_selector/kernels/permute/permute_kernel_f_y_swap_dyn.cpp
+new file mode 100644
+index 00000000..0456f100
+--- /dev/null
++++ b/src/plugins/intel_gpu/src/kernel_selector/kernels/permute/permute_kernel_f_y_swap_dyn.cpp
+@@ -0,0 +1,98 @@
++// Copyright (C) 2018-2026 Intel Corporation
++// SPDX-License-Identifier: Apache-2.0
++//
++
++#include "permute_kernel_f_y_swap_dyn.h"
++
++#include "common_tools.h"
++#include "kernel_selector_utils.h"
++
++namespace kernel_selector {
++
++namespace {
++constexpr size_t kWgDim = 16;
++constexpr size_t kTileSize = 32;  // 2x2 elements per work-item
++
++bool IsFYSwapOrder(const std::vector<uint16_t>& order) {
++    return order.size() == 4 && order[0] == 0 && order[1] == 3 && order[2] == 2 && order[3] == 1;
++}
++}  // namespace
++
++ParamsKey PermuteKernel_f_y_swap_dyn::GetSupportedKey() const {
++    ParamsKey k;
++    k.EnableInputDataType(Datatype::F16);
++    k.EnableInputDataType(Datatype::BF16);
++    k.EnableInputDataType(Datatype::F32);
++    k.EnableInputDataType(Datatype::INT8);
++    k.EnableInputDataType(Datatype::UINT8);
++    k.EnableInputDataType(Datatype::INT32);
++    k.EnableOutputDataType(Datatype::F16);
++    k.EnableOutputDataType(Datatype::BF16);
++    k.EnableOutputDataType(Datatype::F32);
++    k.EnableOutputDataType(Datatype::INT8);
++    k.EnableOutputDataType(Datatype::UINT8);
++    k.EnableOutputDataType(Datatype::INT32);
++    k.EnableDifferentTypes();
++    k.EnableInputLayout(DataLayout::bfyx);
++    k.EnableOutputLayout(DataLayout::bfyx);
++    k.EnableTensorOffset();
++    k.EnableTensorPitches();
++    k.EnableBatching();
++    k.EnableDynamicShapesSupport();
++    return k;
++}
++
++JitConstants PermuteKernel_f_y_swap_dyn::GetJitConstants(const permute_params& params, const CommonDispatchData& dispatchData) const {
++    auto jit = Parent::GetJitConstants(params, dispatchData);
++    jit.AddConstant(MakeJitConstant("TILE_SIZE", kTileSize));
++    jit.AddConstant(MakeJitConstant("WG_DIM", kWgDim));
++    jit.AddConstant(MakeJitConstant("ELEMS_PER_DIM", kTileSize / kWgDim));
++    if (!params.fused_ops.empty()) {
++        const std::vector<std::string> idx_order = {"b", "out_f", "out_y", "out_x"};
++        const FusedOpsConfiguration conf = {"", idx_order, "val", params.inputs[0].GetDType(), 1};
++        jit.Merge(MakeFusedOpsJitConstants(params, {conf}));
++    }
++    return jit;
++}
++
++CommonDispatchData PermuteKernel_f_y_swap_dyn::SetDefault(const permute_params& params) const {
++    CommonDispatchData dispatchData;
++    const auto& in = params.inputs[0];
++    dispatchData.gws = {CeilDiv(in.Y().v, kTileSize) * kWgDim, CeilDiv(in.Feature().v, kTileSize) * kWgDim, in.Batch().v};
++    dispatchData.lws = {kWgDim, kWgDim, 1};
++    return dispatchData;
++}
++
++bool PermuteKernel_f_y_swap_dyn::Validate(const Params& p) const {
++    if (!Parent::Validate(p)) {
++        DO_NOT_USE_THIS_KERNEL(p.layerID);
++    }
++    const auto& params = static_cast<const permute_params&>(p);
++    const auto& in = params.inputs[0];
++    const auto& out = params.outputs[0];
++    if (!IsFYSwapOrder(params.order)) {
++        DO_NOT_USE_THIS_KERNEL(p.layerID);
++    }
++    if (in.GetLayout() != DataLayout::bfyx || out.GetLayout() != DataLayout::bfyx) {
++        DO_NOT_USE_THIS_KERNEL(p.layerID);
++    }
++    // X must be statically 1 (always true for 3D tensors), so the swap is a pure 2D transpose per batch.
++    if (in.X().is_dynamic || in.X().v != 1 || out.X().is_dynamic || out.X().v != 1) {
++        DO_NOT_USE_THIS_KERNEL(p.layerID);
++    }
++    // Static shapes keep using the existing kernels (permute_f_y_axes / tile kernels / ref).
++    if (!params.has_dynamic_tensors()) {
++        DO_NOT_USE_THIS_KERNEL(p.layerID);
++    }
++    // Padded tensors are left to permute_ref.
++    if (in.has_dynamic_pad() || out.has_dynamic_pad()) {
++        DO_NOT_USE_THIS_KERNEL(p.layerID);
++    }
++    return true;
++}
++
++KernelsPriority PermuteKernel_f_y_swap_dyn::GetKernelsPriority(const Params& /*params*/) const {
++    return FORCE_PRIORITY_2;
++}
++
++}  // namespace kernel_selector
+diff --git a/src/plugins/intel_gpu/src/kernel_selector/kernels/permute/permute_kernel_f_y_swap_dyn.h b/src/plugins/intel_gpu/src/kernel_selector/kernels/permute/permute_kernel_f_y_swap_dyn.h
+new file mode 100644
+index 00000000..7104c811
+--- /dev/null
++++ b/src/plugins/intel_gpu/src/kernel_selector/kernels/permute/permute_kernel_f_y_swap_dyn.h
+@@ -0,0 +1,34 @@
++// Copyright (C) 2018-2026 Intel Corporation
++// SPDX-License-Identifier: Apache-2.0
++//
++
++#pragma once
++
++#include "permute_kernel_base.h"
++
++namespace kernel_selector {
++
++// Shape-agnostic SLM-tiled Transpose swapping feature and Y when X == 1.
++// Pattern (cldnn order): {0, 3, 2, 1}  <=  OV order {0, 2, 1} (3D) or {0, 2, 1, 3} (4D, last dim 1).
++// Replaces permute_ref (uncoalesced writes) for the dynamic [B,T,C] <-> [B,C,T] transposes of the
++// causal conv1d in linear-attention (Qwen3.5/3.8 GatedDeltaNet) layers; permute_f_y_axes only handles static shapes.
++class PermuteKernel_f_y_swap_dyn : public PermuteKernelBase {
++public:
++    using Parent = PermuteKernelBase;
++    using Parent::Parent;
++    PermuteKernel_f_y_swap_dyn() : PermuteKernelBase("permute_f_y_swap_dyn") {}
++    ~PermuteKernel_f_y_swap_dyn() override = default;
++
++    bool Validate(const Params& p) const override;
++    KernelsPriority GetKernelsPriority(const Params& params) const override;
++    ParamsKey GetSupportedKey() const override;
++
++protected:
++    JitConstants GetJitConstants(const permute_params& params, const CommonDispatchData& dispatchData) const override;
++    CommonDispatchData SetDefault(const permute_params& params) const override;
++    std::vector<FusedOpType> GetSupportedFusedOps() const override {
++        return {FusedOpType::REORDER, FusedOpType::ACTIVATION, FusedOpType::QUANTIZE, FusedOpType::ELTWISE};
++    }
++};
++
++}  // namespace kernel_selector
+diff --git a/src/plugins/intel_gpu/src/kernel_selector/kernels/permute/permute_kernel_selector.cpp b/src/plugins/intel_gpu/src/kernel_selector/kernels/permute/permute_kernel_selector.cpp
+index 6e818648..0431b1dc 100644
+--- a/src/plugins/intel_gpu/src/kernel_selector/kernels/permute/permute_kernel_selector.cpp
++++ b/src/plugins/intel_gpu/src/kernel_selector/kernels/permute/permute_kernel_selector.cpp
+@@ -9,6 +9,7 @@
+ #include "permute_kernel_bfzyx_to_bfyxz.h"
+ #include "permute_kernel_f_y_axes.h"
+ #include "permute_kernel_xy_swap.h"
++#include "permute_kernel_f_y_swap_dyn.h"
+ 
+ namespace kernel_selector {
+ 
+@@ -19,6 +20,7 @@ permute_kernel_selector::permute_kernel_selector() {
+     Attach<PermuteKernel_bfzyx_to_bfyxz>();
+     Attach<PermuteKernel_f_y_axes>();
+     Attach<PermuteKernel_xy_swap>();
++    Attach<PermuteKernel_f_y_swap_dyn>();
+ }
+ 
+ KernelsData permute_kernel_selector::GetBestKernels(const Params& params) const {

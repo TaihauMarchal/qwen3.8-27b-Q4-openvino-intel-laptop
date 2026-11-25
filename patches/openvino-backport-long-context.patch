@@ -1,0 +1,2441 @@
+# backport-long-ctx: OpenVINO 2026.4.1 (e213a147257) + upstream GPU-plugin backports for long-context speculative decode
+# apply: git -C <openvino @ 2026.4.1> apply backport-long-ctx.patch ; build target openvino_intel_gpu_plugin
+# generated 2026-11-14T03:56:24-10:00 by ~/src/backport-max/export_patch.sh ; see ~/src/backport-max/STATE.md
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_attention_opt.cl b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_attention_opt.cl
+index e9b08ccd..36181cf9 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_attention_opt.cl
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_attention_opt.cl
+@@ -585,20 +585,24 @@ KERNEL(pa_sdpa_opt)(
+         barrier(CLK_LOCAL_MEM_FENCE);
+ 
+         {
+-            // Save temporary exm_sums and max_logits values for each partition_num
++            // Save temporary exm_sums and max_logits values for each partition_num.
++            // Subgroups stride over heads: with small head sizes SUBGROUPS_PER_WG may be smaller than HEADS_PER_WI.
+ #if HEADS_PER_WI > 1 && HEADS_LEFTOVERS_NUM > 0
+-            if (seq_len > SEQ_LEN_PARTITION_SIZE && sgid < HEADS_PER_WI && sgid < iter_heads_num) {
++            const uint stats_heads_num = iter_heads_num;
+ #else
+-            if (seq_len > SEQ_LEN_PARTITION_SIZE && sgid < HEADS_PER_WI) {
+-#endif
+-                const uint head_idx = GET_MULTIPLE_HEAD_IDX_OR_FIXED_VAL(sgid, 0);
+-                const uint exp_sums_offset = seq_idx * HEADS_NUM * total_partitions_num +
+-                                             (head_num_idx + head_idx) * total_partitions_num +
+-                                             partition_idx;
+-                exp_sums[exp_sums_offset] = GET_VECTOR_ELEMENT(exp_sum, head_idx);
+-
+-                const uint max_logits_offset = exp_sums_offset;
+-                max_logits[max_logits_offset] = GET_VECTOR_ELEMENT(qk_max, head_idx);
++            const uint stats_heads_num = HEADS_PER_WI;
++#endif
++            if (seq_len > SEQ_LEN_PARTITION_SIZE) {
++                for (uint q_idx = sgid; q_idx < stats_heads_num; q_idx += SUBGROUPS_PER_WG) {
++                    const uint head_idx = GET_MULTIPLE_HEAD_IDX_OR_FIXED_VAL(q_idx, 0);
++                    const uint exp_sums_offset = seq_idx * HEADS_NUM * total_partitions_num +
++                                                 (head_num_idx + head_idx) * total_partitions_num +
++                                                 partition_idx;
++                    exp_sums[exp_sums_offset] = GET_VECTOR_ELEMENT(exp_sum, head_idx);
++
++                    const uint max_logits_offset = exp_sums_offset;
++                    max_logits[max_logits_offset] = GET_VECTOR_ELEMENT(qk_max, head_idx);
++                }
+             }
+ 
+ #if PAGED_ATTENTION_SCORES_OUTPUT
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_gated_delta_net.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_gated_delta_net.cpp
+index b4805fd8..5728156e 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_gated_delta_net.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_gated_delta_net.cpp
+@@ -7,6 +7,7 @@
+ #include <string_view>
+ 
+ #include "intel_gpu/primitives/paged_gated_delta_net.hpp"
++#include "paged_gated_delta_net_jit_utils.hpp"
+ #include "primitive_ocl_base.hpp"
+ #include "utils/kernel_generator.hpp"
+ 
+@@ -18,21 +19,6 @@ size_t get_v_block_size(size_t v_head_dims) {
+     return 4;
+ }
+ 
+-size_t get_subgroup_size(gpu_arch arch) {
+-    switch (arch) {
+-    case gpu_arch::gen9:
+-    case gpu_arch::gen11:
+-    case gpu_arch::xe_lp:
+-    case gpu_arch::xe_hp:
+-    case gpu_arch::xe_hpg:
+-        return 8;
+-    case gpu_arch::xe2:
+-    case gpu_arch::xe3:
+-    default:
+-        return 16;
+-    }
+-}
+-
+ size_t get_vec_size(const RuntimeParams& params) {
+     const auto& q_layout = params.get_input_layout(paged_gated_delta_net::QUERY);
+     const auto& q_shape = q_layout.get_partial_shape();
+@@ -40,7 +26,7 @@ size_t get_vec_size(const RuntimeParams& params) {
+ 
+     const size_t k_head_dims = q_shape[2].get_length();
+     const size_t v_head_dims = v_shape[2].get_length();
+-    const size_t subgroup_size = get_subgroup_size(params.get_device_info().arch);
++    const size_t subgroup_size = paged_gated_delta_net_jit::get_subgroup_size(params.get_device_info().arch);
+ 
+     if ((k_head_dims % 16) != 0 || (v_head_dims % 16) != 0) {
+         return 1;
+@@ -49,6 +35,7 @@ size_t get_vec_size(const RuntimeParams& params) {
+     size_t vec_size = 1;
+     switch (q_layout.data_type) {
+     case ov::element::f16:
++    case ov::element::bf16:
+         vec_size = 8;
+         break;
+     case ov::element::f32:
+@@ -66,6 +53,51 @@ size_t get_vec_size(const RuntimeParams& params) {
+     return vec_size;
+ }
+ 
++// A call with few tokens per subsequence, decode included: up to 4 tokens for
++// one subsequence; for more, at most 8 tokens per subsequence on average for an
++// f32 query and at most 16 otherwise. The host sees only the totals, so the
++// average stands for the lengths.
++//
++// NOTE: The thresholds are deliberately powers of 2. They were chosen on Panther
++// Lake at (k_head_dims, v_head_dims) = (128, 128) with 16 key and 32 value
++// heads, in f16 and in f32 alike from the crossovers measured with one and
++// with two subsequences, and serve the other head sizes as well.
++// TODO: Consider retuning these thresholds for other devices, other (K, V) head
++// sizes and other numbers of subsequences.
++bool is_short_call(const RuntimeParams& params) {
++    const auto& q_layout = params.get_input_layout(paged_gated_delta_net::QUERY);
++    const auto& q_shape = q_layout.get_partial_shape();
++    const auto& seq_shape = params.get_input_layout(paged_gated_delta_net::SUBSEQUENCE_BEGINS).get_partial_shape();
++    if (q_shape[0].is_dynamic() || seq_shape[0].is_dynamic() || seq_shape[0].get_length() < 2) {
++        return false;
++    }
++    const auto tokens = q_shape[0].get_length();
++    const auto sequences = seq_shape[0].get_length() - 1;
++    const int64_t per_sequence = q_layout.data_type == ov::element::f32 ? 8 : 16;
++    return sequences == 1 ? tokens <= 4 : tokens <= per_sequence * sequences;
++}
++
++// Xe cores: the slices times the sub-slices per slice, or 0 where the driver
++// does not report them.
++size_t get_xe_core_count(const cldnn::device_info& info) {
++    return static_cast<size_t>(info.num_slices) * info.num_sub_slices_per_slice;
++}
++
++// A call runs in the short stage where is_short_call() holds, and every call does
++// on devices with more than 20 Xe cores.
++//
++// NOTE: On the B70 (BMG-G31), the general stage's kernel run on its own, at
++// (k_head_dims, v_head_dims) = (128, 128) with 16 key and 32 value heads, in f16,
++// for one subsequence, was on par with the short kernel at 256 tokens and faster
++// on longer subsequences up to 16Ki tokens, but the gain did not appear inside
++// Qwen3.5-9B-int4-ov. The cause is not known, nor whether it lies in the general
++// stage's kernel.
++// TODO: Find the cause on the B70 and run the general stage on the devices with
++// more than 20 Xe cores again.
++bool uses_short_stage(const RuntimeParams& params) {
++    return get_xe_core_count(params.get_device_info()) > 20 || is_short_call(params);
++}
++
+ class PagedGatedDeltaNetBaseGenerator : public KernelGenerator {
+ public:
+     PagedGatedDeltaNetBaseGenerator(std::string_view kernel_name, bool force_ref_path) : KernelGenerator(kernel_name), m_force_ref_path(force_ref_path) {}
+@@ -91,7 +123,7 @@ protected:
+         jit.make("K_HEAD_DIM", k_head_dims);
+         jit.make("V_HEAD_DIM", v_head_dims);
+         jit.make("V_BLOCK_SIZE", get_v_block_size(v_head_dims));
+-        jit.make("SUBGROUP_SIZE", get_subgroup_size(params.get_device_info().arch));
++        jit.make("SUBGROUP_SIZE", paged_gated_delta_net_jit::get_subgroup_size(params.get_device_info().arch));
+         jit.make("K_VEC_SIZE", m_force_ref_path ? 1 : get_vec_size(params));
+         jit.make("FUSE_QK_L2NORM", desc->use_qk_l2norm ? 1 : 0);
+         jit.make("Q_L2_NORM_EPS", desc->q_l2_norm_eps);
+@@ -129,7 +161,7 @@ protected:
+             const size_t v_head_dims = v_shape[2].get_length();
+             const size_t current_v_block_size = get_v_block_size(v_head_dims);
+             const size_t v_blocks = (v_head_dims + current_v_block_size - 1) / current_v_block_size;
+-            const size_t subgroup_size = get_subgroup_size(params.get_device_info().arch);
++            const size_t subgroup_size = paged_gated_delta_net_jit::get_subgroup_size(params.get_device_info().arch);
+ 
+             auto get_head_offset = [](const cldnn::layout& layout, size_t head_dim_idx) {
+                 const auto& lower_pads = layout.data_padding._lower_size;
+@@ -189,9 +221,118 @@ public:
+     PagedGatedDeltaNetRefGenerator() : PagedGatedDeltaNetBaseGenerator("paged_gated_delta_net_ref", true) {}
+ };
+ 
++class PagedGatedDeltaNetShortGenerator : public PagedGatedDeltaNetBaseGenerator {
++public:
++    PagedGatedDeltaNetShortGenerator() : PagedGatedDeltaNetBaseGenerator("paged_gated_delta_net_short", false) {}
++};
++
+ class PagedGatedDeltaNetOptGenerator : public PagedGatedDeltaNetBaseGenerator {
+ public:
+     PagedGatedDeltaNetOptGenerator() : PagedGatedDeltaNetBaseGenerator("paged_gated_delta_net_opt", false) {}
++
++protected:
++    [[nodiscard]] JitConstants get_jit_constants(const RuntimeParams& params) const override {
++        auto jit = PagedGatedDeltaNetBaseGenerator::get_jit_constants(params);
++
++        const auto& q_shape = params.get_input_layout(paged_gated_delta_net::QUERY).get_partial_shape();
++        const size_t k_head_dims = q_shape[2].get_length();
++        const auto arch = params.get_device_info().arch;
++        const bool d_on_lanes = paged_gated_delta_net_jit::uses_d_on_lanes(k_head_dims, arch);
++        // NOTE: For k_head_dims > 128, where the tiling is always d-on-lanes, every
++        // call runs the plain token loop with one accumulator chain and no
++        // prefetch, instead of the staged loop with 4 chains and an 8-token
++        // prefetch. Tested on Panther Lake at (256, 256), f16 and f32, where the
++        // staged loop is faster on some very long subsequences and on some calls
++        // with many subsequences.
++        const bool plain_loop = k_head_dims > 128;
++
++        jit.make("D_LANES", d_on_lanes ? 1 : 0);
++        jit.remove("V_BLOCK_SIZE");
++        jit.make("V_BLOCK_SIZE", paged_gated_delta_net_jit::get_v_rows_per_thread(k_head_dims, arch));
++        jit.make("PLAIN_TOKEN_LOOP", plain_loop ? 1 : 0);
++
++        // Independent accumulator chains in the two dot products over the k axis.
++        jit.make("ACC_WAYS", plain_loop ? 1 : 4);
++
++        // Prefetch distance in tokens, and the request size in bytes.
++        jit.make("PF_AHEAD", plain_loop ? 0 : 8);
++        jit.make("PF_BYTES", 8);
++
++        jit.make("OCL_REQD_WG", d_on_lanes ? 1 : 0);
++
++        return jit;
++    }
++
++    // The state lives in registers, so the kernel is built for the large
++    // register file where the target has one.
++    [[nodiscard]] std::string get_build_options(const RuntimeParams& params) const override {
++        auto options = PagedGatedDeltaNetBaseGenerator::get_build_options(params);
++        if (paged_gated_delta_net_jit::supports_large_grf(params.get_device_info().arch)) {
++            options += " -cl-intel-256-GRF-per-thread";
++        }
++        return options;
++    }
++
++    [[nodiscard]] DispatchDataFunc get_dispatch_data_func() const override {
++        return DispatchDataFunc{[](const RuntimeParams& params, KernelData& kd, ImplRuntimeParams* rt_params) {
++            assert(!params.is_dynamic());
++            auto& wgs = kd.params.workGroups;
++            const auto& q_shape = params.get_input_layout(paged_gated_delta_net::QUERY).get_partial_shape();
++            const auto& v_shape = params.get_input_layout(paged_gated_delta_net::VALUE).get_partial_shape();
++            const auto& seq_shape = params.get_input_layout(paged_gated_delta_net::SUBSEQUENCE_BEGINS).get_partial_shape();
++
++            const size_t sequences = seq_shape[0].get_length() > 0 ? seq_shape[0].get_length() - 1 : 0;
++            const size_t head_nums = v_shape[1].get_length();
++            const size_t k_head_dims = q_shape[2].get_length();
++            const size_t v_head_dims = v_shape[2].get_length();
++            const auto arch = params.get_device_info().arch;
++            const size_t subgroup_size = paged_gated_delta_net_jit::get_subgroup_size(arch);
++            const size_t v_rows = paged_gated_delta_net_jit::get_v_rows_per_thread(k_head_dims, arch);
++            const size_t v_tiles = v_head_dims / v_rows;
++
++            // The tile axis goes in dimension 0, so that the tiles of one head,
++            // which read the same q and k rows, have consecutive group ids.
++            wgs.global = {v_tiles * subgroup_size, head_nums, sequences};
++            wgs.local = {subgroup_size, 1, 1};
++
++            auto get_head_offset = [](const cldnn::layout& layout, size_t head_dim_idx) {
++                const auto& lower_pads = layout.data_padding._lower_size;
++                return lower_pads.size() > head_dim_idx ? lower_pads[head_dim_idx] : 0;
++            };
++
++            const auto& q_layout = params.input_layouts[paged_gated_delta_net::QUERY];
++            const auto& k_layout = params.input_layouts[paged_gated_delta_net::KEY];
++            const auto& v_layout = params.input_layouts[paged_gated_delta_net::VALUE];
++            auto read_pitch = [](const cldnn::layout& layout, size_t idx) -> int32_t {
++                const auto& pitches = layout.get_pitches();
++                if (idx < pitches.size()) {
++                    return static_cast<int32_t>(pitches[idx]);
++                }
++                return 1;
++            };
++
++            kd.params.scalars.clear();
++            std::vector<int32_t> scalars{
++                static_cast<int32_t>(sequences),
++                static_cast<int32_t>(get_head_offset(q_layout, 1)),
++                static_cast<int32_t>(get_head_offset(k_layout, 1)),
++                static_cast<int32_t>(get_head_offset(v_layout, 1)),
++                read_pitch(q_layout, 0),
++                read_pitch(q_layout, 1),
++                read_pitch(k_layout, 0),
++                read_pitch(k_layout, 1),
++                read_pitch(v_layout, 0),
++                read_pitch(v_layout, 1),
++            };
++
++            for (auto v : scalars) {
++                scalar_desc desc;
++                desc.t = scalar_desc::Types::INT32;
++                desc.v.s32 = v;
++                kd.params.scalars.push_back(desc);
++            }
++        }};
++    }
+ };
+ 
+ class PagedGatedDeltaNetRefImpl : public PrimitiveImplOCL {
+@@ -215,15 +356,26 @@ public:
+     DECLARE_OBJECT_TYPE_SERIALIZATION(ov::intel_gpu::ocl::PagedGatedDeltaNetOptImpl)
+ 
+     Stage::Ptr paged_gated_delta_net = make_stage<PagedGatedDeltaNetOptGenerator>();
++    Stage::Ptr paged_gated_delta_net_short = make_stage<PagedGatedDeltaNetShortGenerator>();
+ 
+     PagedGatedDeltaNetOptImpl() : PrimitiveImplOCL(PagedGatedDeltaNetOpt::get_type_info_static()) {}
+     PagedGatedDeltaNetOptImpl(const program_node& node, const RuntimeParams& params) : PagedGatedDeltaNetOptImpl() {
++        // The general stage is always added, and added first: set_kernels() gives
++        // the i-th compiled kernel to the i-th stage declared with make_stage().
+         add_stage(paged_gated_delta_net, params);
++        if (params.is_dynamic() || uses_short_stage(params)) {
++            add_stage(paged_gated_delta_net_short, params);
++        }
+     }
+ 
+     [[nodiscard]] std::unique_ptr<primitive_impl> clone() const override {
+         return make_deep_copy<PagedGatedDeltaNetOptImpl>(this);
+     }
++
++    // Indices in the order of make_stage().
++    [[nodiscard]] std::vector<size_t> get_stages_execution_order(const RuntimeParams& params) const override {
++        return {has_stage(paged_gated_delta_net_short) && uses_short_stage(params) ? size_t{1} : size_t{0}};
++    }
+ };
+ 
+ }  // namespace
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_gated_delta_net.hpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_gated_delta_net.hpp
+index 1d857b7d..596ae9ba 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_gated_delta_net.hpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_gated_delta_net.hpp
+@@ -9,6 +9,7 @@
+ #include <utility>
+ 
+ #include "paged_gated_delta_net_inst.h"
++#include "paged_gated_delta_net_jit_utils.hpp"
+ #include "program_node.h"
+ #include "registry/implementation_manager.hpp"
+ 
+@@ -82,7 +83,17 @@ protected:
+ 
+         const auto k_head_dims = q_shape[2].get_length();
+         const auto v_head_dims = v_shape[2].get_length();
+-        return (k_head_dims % 16) == 0 && (v_head_dims % 16) == 0;
++        if ((k_head_dims % 16) != 0 || (v_head_dims % 16) != 0) {
++            return false;
++        }
++
++        // The opt kernel puts the k axis (d-on-lanes) or the v axis
++        // (d_v-on-lanes) on the lanes, so the subgroup width has to divide
++        // k_head_dims and fit in v_head_dims. Shapes it cannot tile fall through
++        // to the ref path, which has no such requirement.
++        const auto& device_info = node.get_program().get_engine().get_device_info();
++        const auto subgroup_size = static_cast<int64_t>(paged_gated_delta_net_jit::get_subgroup_size(device_info.arch));
++        return (k_head_dims % subgroup_size) == 0 && v_head_dims >= subgroup_size;
+     }
+ };
+ 
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_gated_delta_net_opt.cl b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_gated_delta_net_opt.cl
+index 1d48cff7..147facad 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_gated_delta_net_opt.cl
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_gated_delta_net_opt.cl
+@@ -6,79 +6,351 @@
+ #include "include/batch_headers/sub_group_block_read.cl"
+ #include "include/batch_headers/sub_group_block_write.cl"
+ #include "include/batch_headers/sub_group_shuffle.cl"
++#include "paged_gated_delta_net_type_utils.cl"
++
++// Gated delta rule, S_t = a_t S_{t-1} (I - b_t k_t k_t^T) + b_t v_t k_t^T, o_t = S_t q_t.
++//
++// Terms:
++//  - S[d_v][d] is one head's V_HEAD_DIM x K_HEAD_DIM state; d_v indexes the v
++//    axis, d the k axis.
++//  - A q or k row is query[token][head][:] or key[token][head][:], the
++//    K_HEAD_DIM elements of one token and head; a v row is S[d_v][:], the
++//    K_HEAD_DIM elements of row d_v of the state.
++//  - A tile is the V_BLOCK_SIZE v rows one subgroup holds.
++//  - A lane is a work item of the subgroup, numbered by get_sub_group_local_id()
++//    from 0 to SUBGROUP_SIZE - 1.
++//  - A lane's interleaved share of a row is its elements d = lane,
++//    lane + SUBGROUP_SIZE, lane + 2 * SUBGROUP_SIZE, ..., which is what a
++//    subgroup block read of the row gives that lane.
++//  - The input state is the state read from the subsequence's first block; a
++//    snapshot is the state written to its next block after every
++//    cache_interval tokens and after its last token.
++//
++// The state is held in registers and distributed over the subgroup in one of
++// two tilings, named after the index of S that runs across the lanes: under
++// d_v-on-lanes lane i holds row i of the tile, whole; under d-on-lanes every
++// lane holds its interleaved share of each row of the tile. The host picks the
++// tiling and V_BLOCK_SIZE; see get_v_rows_per_thread() and get_d_on_lanes_v_rows().
++//
++// Outside PLAIN_TOKEN_LOOP, operands for token t+1 are issued before the state
++// work for token t, so that the loads can overlap the arithmetic. The state
++// update and the output dot product run in one loop rather than two.
+ 
+ #ifndef FUSE_QK_L2NORM
+ #    define FUSE_QK_L2NORM 0
+ #endif
+-
+ #ifndef Q_L2_NORM_EPS
+ #    define Q_L2_NORM_EPS 1e-6f
+ #endif
+-
+ #ifndef K_L2_NORM_EPS
+ #    define K_L2_NORM_EPS 1e-6f
+ #endif
+ 
+-inline float FUNC(l2norm_scale)(float sum, float extra_scale, float eps) {
+-    return rsqrt(sum + eps) * extra_scale;
+-}
++#if ((K_HEAD_DIM % 16) != 0) || ((V_HEAD_DIM % 16) != 0)
++#    error "paged_gated_delta_net_opt requires K_HEAD_DIM and V_HEAD_DIM divisible by 16"
++#endif
++#if ((K_HEAD_DIM % SUBGROUP_SIZE) != 0)
++#    error "K_HEAD_DIM must be a multiple of SUBGROUP_SIZE"
++#endif
+ 
+-inline float FUNC(sum8)(float8 v) {
+-    return v.s0 + v.s1 + v.s2 + v.s3 + v.s4 + v.s5 + v.s6 + v.s7;
+-}
++// Elements of the k axis per lane: the size of an interleaved share.
++#define K_LANE_ELEMS (K_HEAD_DIM / SUBGROUP_SIZE)
++#define K_VEC_COUNT  (K_LANE_ELEMS / K_VEC_SIZE)
+ 
+-inline void FUNC(normalize_kq_128)(float8* b_k, float8* b_q) {
+-#if FUSE_QK_L2NORM
+-    float k_sum = FUNC(sum8)((*b_k) * (*b_k));
+-    k_sum = sub_group_reduce_add(k_sum);
+-    const float k_scale = FUNC(l2norm_scale)(k_sum, 1.0f, K_L2_NORM_EPS);
+-    *b_k *= k_scale;
+-
+-    float q_sum = FUNC(sum8)((*b_q) * (*b_q));
+-    q_sum = sub_group_reduce_add(q_sum);
+-    const float q_scale = FUNC(l2norm_scale)(q_sum, SCALE_FACTOR, Q_L2_NORM_EPS);
+-    *b_q *= q_scale;
++#if ((K_LANE_ELEMS % K_VEC_SIZE) != 0)
++#    error "K_VEC_SIZE must divide K_LANE_ELEMS"
++#endif
++#if ((V_HEAD_DIM % V_BLOCK_SIZE) != 0)
++#    error "V_BLOCK_SIZE must tile V_HEAD_DIM"
++#endif
++#if ((K_HEAD_DIM % ACC_WAYS) != 0)
++#    error "ACC_WAYS must divide K_HEAD_DIM"
++#endif
++
++// --------------------------------------------------------------------------
++// Tiling
++//
++// D_LANES selects the tiling (see the top of the file). d_v-on-lanes keeps
++// K_HEAD_DIM floats of state per lane, d-on-lanes V_BLOCK_SIZE * K_LANE_ELEMS.
++// --------------------------------------------------------------------------
++#if (!D_LANES && (V_BLOCK_SIZE != SUBGROUP_SIZE))
++#    error "under d_v-on-lanes each lane holds one v row, so V_BLOCK_SIZE must equal SUBGROUP_SIZE"
++#endif
++
++// PLAIN_TOKEN_LOOP replaces the software pipeline and the prefetch with a plain
++// token loop.
++#if (PLAIN_TOKEN_LOOP && !D_LANES)
++#    error "PLAIN_TOKEN_LOOP requires D_LANES"
++#endif
++
++// --------------------------------------------------------------------------
++// The distributed q/k/state read
++//
++// A subgroup block read of N elements per lane returns a vector of N in each
++// lane: component j of lane l's vector is the element at offset
++// j * SUBGROUP_SIZE + l. Chunk c reads K_VEC_SIZE elements per lane at offset
++// c * K_VEC_SIZE * SUBGROUP_SIZE, so array element e of lane l holds row element
++// e * SUBGROUP_SIZE + l: the interleaved share, in the order the unrolled loops
++// below index it, so no shuffle is needed.
++//
++// Results go into a float[] rather than a vector because a vector's components
++// can only be named .sN; an array indexed by a constant is register-promoted
++// after unrolling.
++// --------------------------------------------------------------------------
++#if (K_VEC_SIZE == 8)
++#    define PGDN_SPREAD(dst, f, c)                                             \
++        dst[(c) * 8 + 0] = f.s0; dst[(c) * 8 + 1] = f.s1;                      \
++        dst[(c) * 8 + 2] = f.s2; dst[(c) * 8 + 3] = f.s3;                      \
++        dst[(c) * 8 + 4] = f.s4; dst[(c) * 8 + 5] = f.s5;                      \
++        dst[(c) * 8 + 6] = f.s6; dst[(c) * 8 + 7] = f.s7
++#    define PGDN_CHUNK_DECV(KT, v) PGDN_DECV(KT, v, 8)
++#elif (K_VEC_SIZE == 4)
++#    define PGDN_SPREAD(dst, f, c)                                             \
++        dst[(c) * 4 + 0] = f.s0; dst[(c) * 4 + 1] = f.s1;                      \
++        dst[(c) * 4 + 2] = f.s2; dst[(c) * 4 + 3] = f.s3
++#    define PGDN_CHUNK_DECV(KT, v) PGDN_DECV(KT, v, 4)
++#elif (K_VEC_SIZE == 2)
++#    define PGDN_SPREAD(dst, f, c)                                             \
++        dst[(c) * 2 + 0] = f.s0; dst[(c) * 2 + 1] = f.s1
++#    define PGDN_CHUNK_DECV(KT, v) PGDN_DECV(KT, v, 2)
+ #else
+-    *b_q *= SCALE_FACTOR;
++#    define PGDN_SPREAD(dst, f, c) dst[(c)] = f
++#    define PGDN_CHUNK_DECV(KT, v) PGDN_SDEC(KT, v)
+ #endif
+-}
+ 
+-#ifndef K_VEC_SIZE
+-#    define K_VEC_SIZE 1
++#define PGDN_READ_CHUNK(TYPE, KT, dst, p, base, c)                             \
++    do {                                                                       \
++        const MAKE_VECTOR_TYPE(float, K_VEC_SIZE) _f = PGDN_CHUNK_DECV(        \
++            KT, BLOCK_READN(TYPE, K_VEC_SIZE, (p),                             \
++                            (base) + (c) * K_VEC_SIZE * SUBGROUP_SIZE));       \
++        PGDN_SPREAD(dst, _f, c);                                               \
++    } while (0)
++
++#if (K_VEC_COUNT == 1)
++#    define PGDN_READ_LANE(TYPE, KT, dst, p, base)                             \
++        do {                                                                   \
++            PGDN_READ_CHUNK(TYPE, KT, dst, p, base, 0);                        \
++        } while (0)
++#elif (K_VEC_COUNT == 2)
++#    define PGDN_READ_LANE(TYPE, KT, dst, p, base)                             \
++        do {                                                                   \
++            PGDN_READ_CHUNK(TYPE, KT, dst, p, base, 0);                        \
++            PGDN_READ_CHUNK(TYPE, KT, dst, p, base, 1);                        \
++        } while (0)
++#else
++#    define PGDN_READ_LANE(TYPE, KT, dst, p, base)                             \
++        do {                                                                   \
++            unroll_for(int _c = 0; _c < K_VEC_COUNT; ++_c)                     \
++                PGDN_READ_CHUNK(TYPE, KT, dst, p, base, _c);                   \
++        } while (0)
+ #endif
+ 
+-#if ((K_HEAD_DIM % 16) != 0) || ((V_HEAD_DIM % 16) != 0)
+-#    error "paged_gated_delta_net_opt requires K_HEAD_DIM and V_HEAD_DIM divisible by 16"
++// The inverse, for the d-on-lanes state: the same chunks, written back with
++// block writes.
++#if (K_VEC_SIZE == 8)
++#    define PGDN_GATHER(src, c)                                                \
++        (float8)(src[(c) * 8 + 0], src[(c) * 8 + 1], src[(c) * 8 + 2],         \
++                 src[(c) * 8 + 3], src[(c) * 8 + 4], src[(c) * 8 + 5],         \
++                 src[(c) * 8 + 6], src[(c) * 8 + 7])
++#    define PGDN_CHUNK_ENCV(KT, f) PGDN_ENCV(KT, f, 8)
++#elif (K_VEC_SIZE == 4)
++#    define PGDN_GATHER(src, c)                                                \
++        (float4)(src[(c) * 4 + 0], src[(c) * 4 + 1], src[(c) * 4 + 2], src[(c) * 4 + 3])
++#    define PGDN_CHUNK_ENCV(KT, f) PGDN_ENCV(KT, f, 4)
++#elif (K_VEC_SIZE == 2)
++#    define PGDN_GATHER(src, c)    (float2)(src[(c) * 2 + 0], src[(c) * 2 + 1])
++#    define PGDN_CHUNK_ENCV(KT, f) PGDN_ENCV(KT, f, 2)
++#else
++#    define PGDN_GATHER(src, c)    src[(c)]
++#    define PGDN_CHUNK_ENCV(KT, f) PGDN_SENC(KT, f)
+ #endif
+ 
+-#define K_LANE_ELEMS (K_HEAD_DIM / SUBGROUP_SIZE)
++#define S_WRITE(p, base, src)                                                  \
++    do {                                                                       \
++        unroll_for(int _c = 0; _c < K_VEC_COUNT; ++_c)                         \
++            BLOCK_WRITEN(INPUT3_TYPE, K_VEC_SIZE, (p),                         \
++                         (base) + _c * K_VEC_SIZE * SUBGROUP_SIZE,             \
++                         PGDN_CHUNK_ENCV(S_KT, PGDN_GATHER(src, _c)));         \
++    } while (0)
++
++#define Q_READ(dst, p, base) PGDN_READ_LANE(INPUT0_TYPE, Q_KT, dst, p, base)
++#define K_READ(dst, p, base) PGDN_READ_LANE(INPUT1_TYPE, K_KT, dst, p, base)
++#define S_READ(dst, p, base) PGDN_READ_LANE(INPUT3_TYPE, S_KT, dst, p, base)
++
++// One token's operands: q and k, normalized when FUSE_QK_L2NORM is set; v,
++// V_BLOCK_SIZE elements under d-on-lanes and one per lane under d_v-on-lanes;
++// exp(gate); beta.
++#if D_LANES
++#    define PGDN_V_READ(dst, p) VLOAD_VB(dst, p)
++#else
++#    define PGDN_V_READ(dst, p) dst = PGDN_SDEC(V_KT, BLOCK_READN(INPUT2_TYPE, 1, p, 0))
++#endif
++#define PGDN_READ_TOKEN(q, k, v, g, b)                                         \
++    do {                                                                       \
++        Q_READ(q, qp, 0);                                                      \
++        K_READ(k, kp, 0);                                                      \
++        FUNC_CALL(l2_normalize_qk)(q, k, scale_factor);                        \
++        PGDN_V_READ(v, vp);                                                    \
++        g = exp(PGDN_SDEC(G_KT, *gp));                                         \
++        b = PGDN_SDEC(B_KT, *bp);                                              \
++    } while (0)
++
++// Under d_v-on-lanes the dot products over the k axis run inside each lane, which
++// needs every element of the q and k rows: element d is array element
++// d / SUBGROUP_SIZE of lane d % SUBGROUP_SIZE, so KD broadcasts it from there.
++#define KD(v, d) sub_group_broadcast((v)[(d) / SUBGROUP_SIZE], (d) % SUBGROUP_SIZE)
++
++// With V_BLOCK_SIZE 4 or 8, the V_BLOCK_SIZE contiguous elements are read in one
++// access rather than V_BLOCK_SIZE separate loads. start_iv and the output strides
++// are multiples of V_BLOCK_SIZE, and so are the value strides unless the v axis
++// of the value is padded, so the access is naturally aligned.
++#if (V_BLOCK_SIZE == 8)
++#    define VLOAD_VB(dst, p)                                                   \
++        do {                                                                   \
++            const float8 _v = PGDN_DECV(                                       \
++                V_KT,                                                          \
++                *(const __global MAKE_VECTOR_TYPE(INPUT2_TYPE, 8)*)(p), 8);    \
++            dst[0] = _v.s0; dst[1] = _v.s1; dst[2] = _v.s2; dst[3] = _v.s3;    \
++            dst[4] = _v.s4; dst[5] = _v.s5; dst[6] = _v.s6; dst[7] = _v.s7;    \
++        } while (0)
++#    define VSTORE_VB(p, src)                                                  \
++        do {                                                                   \
++            *(__global MAKE_VECTOR_TYPE(OUTPUT_TYPE, 8)*)(p) =                 \
++                PGDN_ENCV(O_KT, ((float8)(src[0], src[1], src[2], src[3],      \
++                                          src[4], src[5], src[6], src[7])),    \
++                          8);                                                  \
++        } while (0)
++#elif (V_BLOCK_SIZE == 4)
++#    define VLOAD_VB(dst, p)                                                   \
++        do {                                                                   \
++            const float4 _v = PGDN_DECV(                                       \
++                V_KT,                                                          \
++                *(const __global MAKE_VECTOR_TYPE(INPUT2_TYPE, 4)*)(p), 4);    \
++            dst[0] = _v.x; dst[1] = _v.y; dst[2] = _v.z; dst[3] = _v.w;        \
++        } while (0)
++#    define VSTORE_VB(p, src)                                                  \
++        do {                                                                   \
++            *(__global MAKE_VECTOR_TYPE(OUTPUT_TYPE, 4)*)(p) =                 \
++                PGDN_ENCV(O_KT, ((float4)(src[0], src[1], src[2], src[3])),    \
++                          4);                                                  \
++        } while (0)
++#else
++#    define VLOAD_VB(dst, p)                                                   \
++        do {                                                                   \
++            unroll_for(int _p = 0; _p < V_BLOCK_SIZE; ++_p)                    \
++                dst[_p] = PGDN_SDEC(V_KT, (p)[_p]);                            \
++        } while (0)
++#    define VSTORE_VB(p, src)                                                  \
++        do {                                                                   \
++            unroll_for(int _p = 0; _p < V_BLOCK_SIZE; ++_p)                    \
++                (p)[_p] = PGDN_SENC(O_KT, src[_p]);                            \
++        } while (0)
++#endif
+ 
+-typedef MAKE_VECTOR_TYPE(float, K_VEC_SIZE) K_VEC_TYPE;
+-#if (K_VEC_SIZE == 1)
+-#    define K_VEC_LOAD_Q(ptr, idx)     convert_float(BLOCK_READN(INPUT0_TYPE, 1, (ptr), (idx)))
+-#    define K_VEC_LOAD_K(ptr, idx)     convert_float(BLOCK_READN(INPUT1_TYPE, 1, (ptr), (idx)))
+-#    define K_VEC_LOAD_STATE(ptr, idx) convert_float(BLOCK_READN(INPUT3_TYPE, 1, (ptr), (idx)))
+-#    define K_VEC_TO_STATE(vec)        ((INPUT3_TYPE)(vec))
+-#    define K_VEC_DOT(a, b)            ((a) * (b))
+-#    define K_VEC_SUM_SQ(a)            ((a) * (a))
+-#elif (K_VEC_SIZE == 8)
+-#    define K_VEC_LOAD_Q(ptr, idx)     convert_float8(BLOCK_READN(INPUT0_TYPE, 8, (ptr), (idx)))
+-#    define K_VEC_LOAD_K(ptr, idx)     convert_float8(BLOCK_READN(INPUT1_TYPE, 8, (ptr), (idx)))
+-#    define K_VEC_LOAD_STATE(ptr, idx) convert_float8(BLOCK_READN(INPUT3_TYPE, 8, (ptr), (idx)))
+-#    define K_VEC_TO_STATE(vec)        CAT(convert_, CAT(INPUT3_TYPE, 8))(vec)
+-#    define K_VEC_DOT(a, b)            FUNC(sum8)((a) * (b))
+-#    define K_VEC_SUM_SQ(a)            FUNC(sum8)((a) * (a))
++// Under d_v-on-lanes a lane's state is one contiguous v row of K_HEAD_DIM
++// elements, loaded in 16-element vectors: one access per lane per vector rather
++// than one per element. K_HEAD_DIM is a multiple of 16, so each vector is
++// naturally aligned.
++//
++// NOTE: The state is stored element by element rather than in such vectors.
++// Measured on Panther Lake at (128, 128), that is faster in f32 and on longer
++// f16 subsequences.
++#define S_VEC16 MAKE_VECTOR_TYPE(INPUT3_TYPE, 16)
++#define S_ROW_LOAD(dst, p)                                                     \
++    do {                                                                       \
++        unroll_for(int _c = 0; _c < K_HEAD_DIM / 16; ++_c) {                   \
++            const float16 _f =                                                 \
++                PGDN_DECV(S_KT, ((const __global S_VEC16*)(p))[_c], 16);       \
++            dst[_c * 16 + 0] = _f.s0;  dst[_c * 16 + 1] = _f.s1;               \
++            dst[_c * 16 + 2] = _f.s2;  dst[_c * 16 + 3] = _f.s3;               \
++            dst[_c * 16 + 4] = _f.s4;  dst[_c * 16 + 5] = _f.s5;               \
++            dst[_c * 16 + 6] = _f.s6;  dst[_c * 16 + 7] = _f.s7;               \
++            dst[_c * 16 + 8] = _f.s8;  dst[_c * 16 + 9] = _f.s9;               \
++            dst[_c * 16 + 10] = _f.sa; dst[_c * 16 + 11] = _f.sb;              \
++            dst[_c * 16 + 12] = _f.sc; dst[_c * 16 + 13] = _f.sd;              \
++            dst[_c * 16 + 14] = _f.se; dst[_c * 16 + 15] = _f.sf;              \
++        }                                                                      \
++    } while (0)
++
++// Accumulator chains cannot exceed what there is to chain: under d-on-lanes a
++// lane holds K_LANE_ELEMS of the k axis, not K_HEAD_DIM.
++#define WAYS_D (ACC_WAYS < K_LANE_ELEMS ? ACC_WAYS : K_LANE_ELEMS)
++
++inline void FUNC(l2_normalize_qk)(float* qq, float* kk, float scale_factor) {
++#if FUSE_QK_L2NORM
++    float qs = 0.0f, ks = 0.0f;
++    unroll_for(int c = 0; c < K_LANE_ELEMS; ++c) {
++        qs += qq[c] * qq[c];
++        ks += kk[c] * kk[c];
++    }
++    const float q_scale = rsqrt(sub_group_reduce_add(qs) + Q_L2_NORM_EPS) * scale_factor;
++    const float k_scale = rsqrt(sub_group_reduce_add(ks) + K_L2_NORM_EPS);
+ #else
+-#    define K_VEC_LOAD_Q(ptr, idx)     CAT(convert_float, K_VEC_SIZE)(BLOCK_READN(INPUT0_TYPE, K_VEC_SIZE, (ptr), (idx)))
+-#    define K_VEC_LOAD_K(ptr, idx)     CAT(convert_float, K_VEC_SIZE)(BLOCK_READN(INPUT1_TYPE, K_VEC_SIZE, (ptr), (idx)))
+-#    define K_VEC_LOAD_STATE(ptr, idx) CAT(convert_float, K_VEC_SIZE)(BLOCK_READN(INPUT3_TYPE, K_VEC_SIZE, (ptr), (idx)))
+-#    define K_VEC_TO_STATE(vec)        CAT(convert_, CAT(INPUT3_TYPE, K_VEC_SIZE))(vec)
+-#    define K_VEC_DOT(a, b)            dot((a), (b))
+-#    define K_VEC_SUM_SQ(a)            dot((a), (a))
++    const float q_scale = scale_factor;
++    const float k_scale = 1.0f;
+ #endif
++    unroll_for(int c = 0; c < K_LANE_ELEMS; ++c) {
++        qq[c] *= q_scale;
++        kk[c] *= k_scale;
++    }
++}
++
++#if D_LANES
++// One token under d-on-lanes, in two passes over the lane's state elements.
++// Pass 1 takes h_k against the undecayed state and multiplies the result by the
++// decay a = exp(gate): a * (S . k) == (a * S) . k, so the decay reaches the
++// state only in pass 2 and the decayed state is computed once. Pass 2 fuses the
++// state update with the output dot product. Every lane returns the totals in
++// o_val. Under d_v-on-lanes the state is decayed in pass 1 instead.
++//
++// NOTE: Measured on Panther Lake at (256, 256), decaying the state in pass 1
++// here is slower in f16 and f32 and spills in f32.
++inline void FUNC(d_on_lanes_token)(float state[V_BLOCK_SIZE][K_LANE_ELEMS],
++                                const float* qv,
++                                const float* kv,
++                                const float* v_val,
++                                float b_g,
++                                float b_beta,
++                                float* o_val) {
++    float update[V_BLOCK_SIZE];
++    unroll_for(int p = 0; p < V_BLOCK_SIZE; ++p) {
++        float acc[WAYS_D];
++        unroll_for(int a = 0; a < WAYS_D; ++a) acc[a] = state[p][a] * kv[a];
++        unroll_for(int c = WAYS_D; c < K_LANE_ELEMS; ++c) acc[c % WAYS_D] += state[p][c] * kv[c];
++        float part = 0.0f;
++        unroll_for(int a = 0; a < WAYS_D; ++a) part += acc[a];
++        const float h_k = sub_group_reduce_add(part) * b_g;
++        update[p] = (v_val[p] - h_k) * b_beta;
++    }
++    unroll_for(int p = 0; p < V_BLOCK_SIZE; ++p) {
++        float acc[WAYS_D];
++        unroll_for(int a = 0; a < WAYS_D; ++a) {
++            state[p][a] = state[p][a] * b_g + update[p] * kv[a];
++            acc[a] = state[p][a] * qv[a];
++        }
++        unroll_for(int c = WAYS_D; c < K_LANE_ELEMS; ++c) {
++            state[p][c] = state[p][c] * b_g + update[p] * kv[c];
++            acc[c % WAYS_D] += state[p][c] * qv[c];
++        }
++        float part = 0.0f;
++        unroll_for(int a = 0; a < WAYS_D; ++a) part += acc[a];
++        o_val[p] = sub_group_reduce_add(part);
++    }
++}
+ 
+-#define K_VEC_COUNT (K_LANE_ELEMS / K_VEC_SIZE)
++// Each lane holds its interleaved share of each v row, so a snapshot is
++// written row by row with block writes.
++inline void FUNC(d_on_lanes_snapshot)(__global INPUT3_TYPE* sp, float state[V_BLOCK_SIZE][K_LANE_ELEMS]) {
++    unroll_for(int p = 0; p < V_BLOCK_SIZE; ++p) S_WRITE(sp, p * K_HEAD_DIM, state[p]);
++}
++#endif
+ 
++// reqd_work_group_size lets the compiler prove the launch shape and therefore
++// prove gate, beta and the prefetch addresses uniform. The host sets it under
++// d-on-lanes.
++#if OCL_REQD_WG
++__attribute__((reqd_work_group_size(SUBGROUP_SIZE, 1, 1)))
++#endif
+ REQD_SUB_GROUP_SIZE(SUBGROUP_SIZE)
+ KERNEL(paged_gated_delta_net_opt)
+ (__global INPUT0_TYPE* query,
+@@ -103,17 +375,25 @@ KERNEL(paged_gated_delta_net_opt)
+  int k_head_stride,
+  int v_token_stride,
+  int v_head_stride) {
+-    const int seq = get_global_id(0);
+-    const int h = get_global_id(1);
+-    const int v_block = get_group_id(2);
+-    const int lid = get_sub_group_local_id();
+-    const int start_iv = v_block * V_BLOCK_SIZE;
++    const int v_tile = (int)get_group_id(0);
++    const int h = (int)get_global_id(1);
++    const int seq = (int)get_global_id(2);
++    const int lane = (int)get_sub_group_local_id();
++    const int start_iv = v_tile * V_BLOCK_SIZE;
++
++    const float scale_factor = SCALE_FACTOR;
+ 
+     const int token_begin = subsequence_begins[seq];
+     const int token_end = subsequence_begins[seq + 1];
+     const int block_begin = block_indices_begins[seq];
+     const int past_len = past_lens[seq];
+     const int interval = cache_interval[seq];
++    // An empty subsequence has nothing to update, and the reads below would go
++    // past its end in query, key, value, gate and beta and take a snapshot block
++    // it need not have. Uniform across the work group.
++    if (token_begin >= token_end) {
++        return;
++    }
+     const int prev_nums = interval > 0 ? past_len % interval : 0;
+ 
+     const int group_size = V_HEAD_NUM / K_HEAD_NUM;
+@@ -123,154 +403,220 @@ KERNEL(paged_gated_delta_net_opt)
+     const int v_head_base = (h + value_head_offset) * v_head_stride;
+     const int state_stride = K_HEAD_DIM * V_HEAD_DIM;
+ 
+-    K_VEC_TYPE state[V_BLOCK_SIZE][K_VEC_COUNT];
+-    K_VEC_TYPE q_norm[K_VEC_COUNT];
+-    K_VEC_TYPE k_norm[K_VEC_COUNT];
+-
+     const int initial_block_id = block_indices[block_begin];
+-    const int initial_block_base = (initial_block_id * V_HEAD_NUM + h) * state_stride;
+-
+-#pragma unroll
+-    for (int v_idx = 0; v_idx < V_BLOCK_SIZE; v_idx++) {
+-        int curr_iv = start_iv + v_idx;
+-        int base = initial_block_base + curr_iv * K_HEAD_DIM;
+-#if (K_VEC_SIZE == 8) && (K_VEC_COUNT == 1)
+-        state[v_idx][0] = K_VEC_LOAD_STATE(recurrent_state_table, base);
+-#else
+-#    pragma unroll
+-        for (int kc = 0; kc < K_VEC_COUNT; kc++) {
+-            const int k_base = kc * K_VEC_SIZE * SUBGROUP_SIZE;
+-            state[v_idx][kc] = K_VEC_LOAD_STATE(recurrent_state_table, base + k_base);
++    // The first snapshot's block, which a non-empty subsequence always writes,
++    // read ahead so that the snapshot does not wait for it behind the output
++    // stores.
++    int next_block_id = block_indices[block_begin + 1];
++    const long initial_base =
++        (long)(initial_block_id * V_HEAD_NUM + h) * state_stride + (long)start_iv * K_HEAD_DIM;
++
++    // The input state: under d-on-lanes each lane's interleaved share of each
++    // v row, read with block reads; under d_v-on-lanes each lane's whole v row,
++    // loaded in 16-element vectors.
++#if D_LANES
++    float state[V_BLOCK_SIZE][K_LANE_ELEMS];
++    {
++        const __global INPUT3_TYPE* sp = recurrent_state_table + initial_base;
++        unroll_for(int p = 0; p < V_BLOCK_SIZE; ++p) {
++            float row[K_LANE_ELEMS];
++            S_READ(row, sp, p * K_HEAD_DIM);
++            unroll_for(int c = 0; c < K_LANE_ELEMS; ++c) state[p][c] = row[c];
+         }
+-#endif
+     }
++#else
++    float state[K_HEAD_DIM];
++    {
++        const __global INPUT3_TYPE* sp = recurrent_state_table + initial_base + (long)lane * K_HEAD_DIM;
++        S_ROW_LOAD(state, sp);
++    }
++#endif
+ 
+     int token = token_begin;
+     int slot = 1;
+-    int tokens_to_next_boundary = interval > 0 ? (prev_nums > 0 ? (interval - prev_nums) : interval) : (token_end - token_begin);
+-    while (token < token_end) {
+-        const int chunk_end = min(token + tokens_to_next_boundary, token_end);
+-
+-        int q_base = token * q_token_stride + q_head_base;
+-        int k_base = token * k_token_stride + k_head_base;
+-        int v_base = token * v_token_stride + v_head_base;
+-        int g_idx = token * V_HEAD_NUM + h;
++    int tokens_to_next_boundary =
++        interval > 0 ? (prev_nums > 0 ? (interval - prev_nums) : interval) : (token_end - token_begin);
++
++    const __global INPUT0_TYPE* qp = query + (long)token * q_token_stride + q_head_base;
++    const __global INPUT1_TYPE* kp = key + (long)token * k_token_stride + k_head_base;
++    const __global INPUT2_TYPE* vp = value + (long)token * v_token_stride + v_head_base + start_iv;
++    const __global INPUT4_TYPE* gp = gate + (long)token * V_HEAD_NUM + h;
++    const __global INPUT5_TYPE* bp = beta + (long)token * V_HEAD_NUM + h;
++    __global OUTPUT_TYPE* op = output + (long)(token * V_HEAD_NUM + h) * V_HEAD_DIM + start_iv;
++
++#if !PLAIN_TOKEN_LOOP
++#if PF_AHEAD > 0
++    // Clamped: the prefetch runs PF_AHEAD tokens ahead, which is past the end
++    // for a subsequence shorter than that.
++    const int pf_first = min(PF_AHEAD, max(token_end - 1 - token, 0));
++    const __global INPUT0_TYPE* pfq = qp + (long)pf_first * q_token_stride;
++    const __global INPUT1_TYPE* pfk = kp + (long)pf_first * k_token_stride;
++    const __global INPUT2_TYPE* pfv = vp + (long)pf_first * v_token_stride;
++#endif
+ 
+-        for (; token < chunk_end; token++, q_base += q_token_stride, k_base += k_token_stride, v_base += v_token_stride, g_idx += V_HEAD_NUM) {
+-#if (K_VEC_SIZE == 8) && (K_VEC_COUNT == 1)
+-            q_norm[0] = K_VEC_LOAD_Q(query, q_base);
+-            k_norm[0] = K_VEC_LOAD_K(key, k_base);
+-            FUNC(normalize_kq_128)(&k_norm[0], &q_norm[0]);
++    // Prologue of the software pipeline: the first token's operands.
++    float q_pre[K_LANE_ELEMS], k_pre[K_LANE_ELEMS];
++#if D_LANES
++    float v_pre[V_BLOCK_SIZE];
+ #else
+-            float q_sum_local = 0.0f;
+-            float k_sum_local = 0.0f;
+-#    pragma unroll
+-            for (int kc = 0; kc < K_VEC_COUNT; kc++) {
+-                const int offset = kc * K_VEC_SIZE * SUBGROUP_SIZE;
+-                q_norm[kc] = K_VEC_LOAD_Q(query, q_base + offset);
+-                k_norm[kc] = K_VEC_LOAD_K(key, k_base + offset);
+-                q_sum_local += K_VEC_SUM_SQ(q_norm[kc]);
+-                k_sum_local += K_VEC_SUM_SQ(k_norm[kc]);
+-            }
+-
+-            float q_scale = SCALE_FACTOR;
+-            float k_scale = 1.0f;
+-#    if FUSE_QK_L2NORM
+-            const float q_sum = sub_group_reduce_add(q_sum_local);
+-            const float k_sum = sub_group_reduce_add(k_sum_local);
+-
+-            q_scale = FUNC(l2norm_scale)(q_sum, SCALE_FACTOR, Q_L2_NORM_EPS);
+-            k_scale = FUNC(l2norm_scale)(k_sum, 1.0f, K_L2_NORM_EPS);
+-#    endif
+-#    pragma unroll
+-            for (int kc = 0; kc < K_VEC_COUNT; kc++) {
+-                q_norm[kc] *= q_scale;
+-                k_norm[kc] *= k_scale;
+-            }
++    float v_pre;
++#endif
++    float g_pre, b_pre;
++    PGDN_READ_TOKEN(q_pre, k_pre, v_pre, g_pre, b_pre);
+ #endif
+ 
+-            const float b_g = exp(convert_float(gate[g_idx]));
+-            const float b_beta = convert_float(beta[g_idx]);
+-
+-            float b_v_block[V_BLOCK_SIZE];
+-            float h_k_block[V_BLOCK_SIZE];
+-            float update_block[V_BLOCK_SIZE];
+-            float out_block[V_BLOCK_SIZE];
+-#pragma unroll
+-            for (int v_idx = 0; v_idx < V_BLOCK_SIZE; v_idx++) {
+-                const int curr_iv = start_iv + v_idx;
+-                const int v_base_aligned = v_base + (curr_iv & ~(SUBGROUP_SIZE - 1));
+-                const int v_lane = curr_iv & (SUBGROUP_SIZE - 1);
+-                const float v_val = convert_float(BLOCK_READN(INPUT2_TYPE, 1, value, v_base_aligned));
+-                b_v_block[v_idx] = sub_group_broadcast(v_val, v_lane);
+-            }
++    while (token < token_end) {
++        const int chunk_end = min(token + tokens_to_next_boundary, token_end);
+ 
+-#pragma unroll
+-            for (int v_idx = 0; v_idx < V_BLOCK_SIZE; v_idx++) {
+-                float h_k_local = 0.0f;
+-#if (K_VEC_SIZE == 8) && (K_VEC_COUNT == 1)
+-                state[v_idx][0] *= b_g;
+-                h_k_local = FUNC(sum8)(state[v_idx][0] * k_norm[0]);
++#if PLAIN_TOKEN_LOOP
++        for (; token < chunk_end; ++token) {
++            float qv[K_LANE_ELEMS], kv[K_LANE_ELEMS], v_val[V_BLOCK_SIZE], o_val[V_BLOCK_SIZE], b_g, b_beta;
++            PGDN_READ_TOKEN(qv, kv, v_val, b_g, b_beta);
++            FUNC_CALL(d_on_lanes_token)(state, qv, kv, v_val, b_g, b_beta, o_val);
++            if (lane == 0)
++                VSTORE_VB(op, o_val);
++            qp += q_token_stride;
++            kp += k_token_stride;
++            vp += v_token_stride;
++            gp += V_HEAD_NUM;
++            bp += V_HEAD_NUM;
++            op += V_HEAD_NUM * V_HEAD_DIM;
++        }
+ #else
+-#    pragma unroll
+-                for (int kc = 0; kc < K_VEC_COUNT; kc++) {
+-                    state[v_idx][kc] *= b_g;
+-                    h_k_local += K_VEC_DOT(state[v_idx][kc], k_norm[kc]);
++        // The pipeline stages token+1 and the prefetch reads PF_AHEAD further,
++        // so both would leave the buffer at the end of a subsequence. Rather
++        // than check the bounds in every iteration, the token range is split
++        // into segments and the advance strides are zeroed where advancing
++        // would overrun: segment 0 advances both, segment 1 freezes the
++        // prefetch, segment 2 freezes both. A frozen pointer re-reads the last
++        // valid token and the staged value is discarded by the loop exit, so no
++        // arithmetic changes.
++        //
++        // Unrolled under d_v-on-lanes only, so that each segment there sees its
++        // strides as constants.
++#if !D_LANES
++        __attribute__((opencl_unroll_hint))
++#endif
++        for (int seg = 0; seg < 3; ++seg) {
++            int seg_end;
++            if (seg == 0)
++                seg_end = min(chunk_end, max(token_end - PF_AHEAD - 1, token));
++            else if (seg == 1)
++                seg_end = min(chunk_end, max(token_end - 1, token));
++            else
++                seg_end = chunk_end;
++
++            const int qs = (seg < 2) ? q_token_stride : 0;
++            const int ks = (seg < 2) ? k_token_stride : 0;
++            const int vs = (seg < 2) ? v_token_stride : 0;
++            const int gs = (seg < 2) ? V_HEAD_NUM : 0;
++            const int bs = (seg < 2) ? V_HEAD_NUM : 0;
++            const int pq = (seg < 1) ? q_token_stride : 0;
++            const int pk = (seg < 1) ? k_token_stride : 0;
++            const int pv = (seg < 1) ? v_token_stride : 0;
++
++            for (; token < seg_end; ++token) {
++                float qv[K_LANE_ELEMS], kv[K_LANE_ELEMS];
++                unroll_for(int c = 0; c < K_LANE_ELEMS; ++c) {
++                    qv[c] = q_pre[c];
++                    kv[c] = k_pre[c];
+                 }
++#if D_LANES
++                float v_val[V_BLOCK_SIZE];
++                unroll_for(int p = 0; p < V_BLOCK_SIZE; ++p) v_val[p] = v_pre[p];
++#else
++                const float v_val = v_pre;
+ #endif
+-                h_k_block[v_idx] = sub_group_reduce_add(h_k_local);
+-            }
+-
+-#pragma unroll
+-            for (int v_idx = 0; v_idx < V_BLOCK_SIZE; v_idx++) {
+-                update_block[v_idx] = (b_v_block[v_idx] - h_k_block[v_idx]) * b_beta;
+-            }
++                const float b_g = g_pre;
++                const float b_beta = b_pre;
++
++                {
++                    qp += qs;
++                    kp += ks;
++                    vp += vs;
++                    gp += gs;
++                    bp += bs;
++                    PGDN_READ_TOKEN(q_pre, k_pre, v_pre, g_pre, b_pre);
++                }
+ 
+-#pragma unroll
+-            for (int v_idx = 0; v_idx < V_BLOCK_SIZE; v_idx++) {
+-                float out_val_local = 0.0f;
+-#if (K_VEC_SIZE == 8) && (K_VEC_COUNT == 1)
+-                state[v_idx][0] = fma(k_norm[0], update_block[v_idx], state[v_idx][0]);
+-                out_val_local = FUNC(sum8)(state[v_idx][0] * q_norm[0]);
+-#else
+-#    pragma unroll
+-                for (int kc = 0; kc < K_VEC_COUNT; kc++) {
+-                    state[v_idx][kc] = fma(k_norm[kc], update_block[v_idx], state[v_idx][kc]);
+-                    out_val_local += K_VEC_DOT(state[v_idx][kc], q_norm[kc]);
++#if PF_AHEAD > 0
++                // PF_BYTES is the size of each prefetch request; it is not meant
++                // to cover the row. The prefetch issues one request each for q,
++                // k and v per token, at the start of each one's row.
++                {
++                    pfq += pq;
++                    pfk += pk;
++                    pfv += pv;
++                    prefetch(pfq, PF_BYTES / sizeof(INPUT0_TYPE));
++                    prefetch(pfk, PF_BYTES / sizeof(INPUT1_TYPE));
++                    prefetch(pfv, PF_BYTES / sizeof(INPUT2_TYPE));
+                 }
+ #endif
+-                out_block[v_idx] = sub_group_reduce_add(out_val_local);
+-            }
+-
+-#pragma unroll
+-            for (int v_idx = 0; v_idx < V_BLOCK_SIZE; v_idx++) {
+-                int curr_iv = start_iv + v_idx;
+-                const float out_val = out_block[v_idx];
+ 
+-                if (lid == 0) {
+-                    const int out_offset = (token * V_HEAD_NUM + h) * V_HEAD_DIM + curr_iv;
+-                    output[out_offset] = TO_OUTPUT_TYPE(out_val);
++#if D_LANES
++                float o_val[V_BLOCK_SIZE];
++                FUNC_CALL(d_on_lanes_token)(state, qv, kv, v_val, b_g, b_beta, o_val);
++                // Every lane holds the totals, so lane 0 alone writes them, with
++                // an ordinary store: a block write has to be executed by the whole
++                // subgroup and cannot go under this if.
++                if (lane == 0)
++                    VSTORE_VB(op, o_val);
++#else
++                // Pass 1 decays the state and takes h_k against the decayed state;
++                // pass 2 adds the update and takes the output dot product. Both
++                // dot products over the k axis run inside the lane. In
++                // d_on_lanes_token() the state is decayed in pass 2 instead.
++                //
++                // NOTE: Measured on Panther Lake at (128, 128), decaying the state
++                // in pass 1 here is faster in f32 on long subsequences.
++                float hk_acc[ACC_WAYS];
++                unroll_for(int a = 0; a < ACC_WAYS; ++a) {
++                    state[a] *= b_g;
++                    hk_acc[a] = state[a] * KD(kv, a);
++                }
++                unroll_for(int d = ACC_WAYS; d < K_HEAD_DIM; ++d) {
++                    state[d] *= b_g;
++                    hk_acc[d % ACC_WAYS] += state[d] * KD(kv, d);
++                }
++                float h_k = 0.0f;
++                unroll_for(int a = 0; a < ACC_WAYS; ++a) h_k += hk_acc[a];
++                const float update = (v_val - h_k) * b_beta;
++
++                float out_acc[ACC_WAYS];
++                unroll_for(int a = 0; a < ACC_WAYS; ++a) {
++                    state[a] = fma(KD(kv, a), update, state[a]);
++                    out_acc[a] = state[a] * KD(qv, a);
++                }
++                unroll_for(int d = ACC_WAYS; d < K_HEAD_DIM; ++d) {
++                    state[d] = fma(KD(kv, d), update, state[d]);
++                    out_acc[d % ACC_WAYS] += state[d] * KD(qv, d);
+                 }
++                float o = 0.0f;
++                unroll_for(int a = 0; a < ACC_WAYS; ++a) o += out_acc[a];
++
++                BLOCK_WRITEN(OUTPUT_TYPE, 1, op, 0, PGDN_SENC(O_KT, o));
++#endif
++                // The output is a contiguous [token][v_head][v] tensor with no
++                // padding, so op advances by V_HEAD_NUM * V_HEAD_DIM per token,
++                // not by v_token_stride: the value input may be a padded view of
++                // a fused projection, whose token stride is larger.
++                op += V_HEAD_NUM * V_HEAD_DIM;
+             }
+         }
++#endif
+ 
+-        const int block_id = block_indices[block_begin + slot];
++        const int block_id = next_block_id;
+         slot++;
+-        const int block_base = (block_id * V_HEAD_NUM + h) * state_stride;
+-#pragma unroll
+-        for (int v_idx = 0; v_idx < V_BLOCK_SIZE; v_idx++) {
+-            int curr_iv = start_iv + v_idx;
+-            int base = block_base + curr_iv * K_HEAD_DIM;
+-#if (K_VEC_SIZE == 8) && (K_VEC_COUNT == 1)
+-            BLOCK_WRITEN(INPUT3_TYPE, K_VEC_SIZE, recurrent_state_table, base, K_VEC_TO_STATE(state[v_idx][0]));
++        if (token < token_end)
++            next_block_id = block_indices[block_begin + slot];
++        const long block_base =
++            (long)(block_id * V_HEAD_NUM + h) * state_stride + (long)start_iv * K_HEAD_DIM;
++#if D_LANES
++        FUNC_CALL(d_on_lanes_snapshot)(recurrent_state_table + block_base, state);
+ #else
+-#    pragma unroll
+-            for (int kc = 0; kc < K_VEC_COUNT; kc++) {
+-                const int k_base = kc * K_VEC_SIZE * SUBGROUP_SIZE;
+-                BLOCK_WRITEN(INPUT3_TYPE, K_VEC_SIZE, recurrent_state_table, base + k_base, K_VEC_TO_STATE(state[v_idx][kc]));
+-            }
++        unroll_for(int d = 0; d < K_HEAD_DIM; ++d)
++            (recurrent_state_table + block_base + (long)lane * K_HEAD_DIM)[d] = PGDN_SENC(S_KT, state[d]);
+ #endif
+-        }
+ 
+         if (interval > 0)
+             tokens_to_next_boundary = interval;
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa/paged_attention_opt.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa/paged_attention_opt.cpp
+index 622e5127..94d7ba4b 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa/paged_attention_opt.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa/paged_attention_opt.cpp
+@@ -11,7 +11,9 @@
+ 
+ #include <array>
+ #include <cstdint>
++#include <cstdlib>
+ #include <memory>
++#include <optional>
+ #include <utility>
+ 
+ #include "../primitive_ocl_base.hpp"
+@@ -33,6 +35,30 @@ constexpr size_t paged_attention_block_size = 16;
+ constexpr size_t seq_len_partition_size = 256;
+ constexpr size_t subgroup_size = 16;
+ constexpr size_t u4_elems_per_byte = 2;
++// Max query tokens per subsequence in MIXED stage to treat it as speculative decoding and use the GQA kernel.
++// Override with OV_GPU_PA_GQA_MULTI_TOKENS_MAX (0 disables the GQA multi-token path).
++inline int32_t get_max_gqa_multi_tokens_per_subsequence() {
++    static const int32_t value = [] {
++        const char* env = std::getenv("OV_GPU_PA_GQA_MULTI_TOKENS_MAX");
++        return env ? static_cast<int32_t>(std::strtol(env, nullptr, 10)) : 16;
++    }();
++    return value;
++}
++
++// Force the GQA multi-token kernel with OV_GPU_PA_GQA_MULTI_TOKENS_KERNEL (values of GQAMultiTokensKernel:
++// 0 none, 1 small_q, 2 fallback). Unsupported choices fall back to automatic selection.
++inline std::optional<GQAMultiTokensKernel> get_forced_gqa_multi_tokens_kernel() {
++    static const auto value = []() -> std::optional<GQAMultiTokensKernel> {
++        const char* env = std::getenv("OV_GPU_PA_GQA_MULTI_TOKENS_KERNEL");
++        if (!env)
++            return std::nullopt;
++        const auto kernel = std::strtol(env, nullptr, 10);
++        if (kernel < 0 || kernel > static_cast<long>(GQAMultiTokensKernel::FALLBACK))
++            return std::nullopt;
++        return static_cast<GQAMultiTokensKernel>(kernel);
++    }();
++    return value;
++}
+ 
+ inline bool get_kv_compressed(const RuntimeParams& params) {
+     auto key_cache_layout = params.input_layouts[PagedAttentionInputIdx::KEY_CACHE];
+@@ -116,6 +142,122 @@ inline bool can_use_gqa_kernel(const kernel_impl_params& params, const PagedAtte
+     return can_use_gqa_kernel;
+ }
+ 
++// pa_small_q_opt.cl: query rows (tokens x heads of one KV group) handled by one subgroup, equal to the DPAS M tile
++constexpr size_t gqa_multi_tokens_rows_per_sg = 8;
++
++inline size_t get_gqa_multi_tokens_per_sg(const kernel_impl_params& params) {
++    const auto desc = params.typed_desc<paged_attention>();
++    return gqa_multi_tokens_rows_per_sg / (desc->heads_num / desc->kv_heads_num);
++}
++
++inline size_t get_max_subsequence_len(const kernel_impl_params& params) {
++    const auto subsequence_begins_mem = params.memory_deps.at(PagedAttentionInputIdx::SUBSEQUENCE_BEGINS);
++    mem_lock<int32_t, mem_lock_type::read> subsequence_begins_mem_lock(subsequence_begins_mem, *params.strm);
++    size_t max_len = 0;
++    for (size_t i = 0; i + 1 < subsequence_begins_mem_lock.size(); i++) {
++        max_len = std::max(max_len, static_cast<size_t>(subsequence_begins_mem_lock[i + 1] - subsequence_begins_mem_lock[i]));
++    }
++    return max_len;
++}
++
++size_t get_max_context_len(const kernel_impl_params& params) {
++    const auto& input_mem = params.memory_deps;
++    const auto max_context_len = input_mem.at(PagedAttentionInputIdx::MAX_CONTEXT_LEN);
++    mem_lock<int32_t, mem_lock_type::read> max_context_len_mem_lock(max_context_len, *params.strm);
++    const auto paged_attention_max_len = max_context_len_mem_lock[0];
++    return paged_attention_max_len;
++}
++
++// The fallback kernel reads the KV cache once per query token, pa_small_q_opt.cl once per partition at a higher fixed
++// cost. Measured on Xe2/Xe3 for 3..16 tokens, the two cross where tokens^2 x context ~= 64K.
++inline bool prefer_gqa_multi_tokens_fallback_kernel(size_t max_tokens, size_t max_context_len) {
++    return max_tokens * max_tokens * max_context_len <= 64 * 1024;
++}
++
++// GQA multi-token path of paged_attention_opt.cl; the sink and scores output code there assumes one head per work-item
++inline bool supports_gqa_multi_tokens_fallback_kernel(const kernel_impl_params& params) {
++    const auto desc = params.typed_desc<paged_attention>();
++    const size_t kv_group_size = desc->heads_num / desc->kv_heads_num;
++    return kv_group_size > 1 && !desc->has_sink_input && !desc->has_scores_output();
++}
++
++inline bool supports_gqa_multi_tokens_dpas_kernel(const kernel_impl_params& params) {
++    if (!supports_gqa_multi_tokens_fallback_kernel(params))
++        return false;
++
++    const auto& info = params.get_device_info();
++    // SIMD16 DPAS
++    if (!info.supports_immad || info.arch < gpu_arch::xe_hpc)
++        return false;
++
++    const auto desc = params.typed_desc<paged_attention>();
++    if (desc->has_token_type_ids)
++        return false;
++    const size_t kv_group_size = desc->heads_num / desc->kv_heads_num;
++    if (gqa_multi_tokens_rows_per_sg % kv_group_size != 0)
++        return false;
++
++    const size_t head_size = desc->k_head_size;
++    if (head_size != desc->v_head_size || head_size % (u4_elems_per_byte * subgroup_size) != 0 || head_size > 256)
++        return false;
++
++    if (params.get_input_layout(PagedAttentionInputIdx::QUERY).data_type != data_types::f16)
++        return false;
++    if (!get_kv_compressed(params) && params.get_input_layout(PagedAttentionInputIdx::KEY_CACHE).data_type != data_types::f16)
++        return false;
++
++    // Double-buffered f16 K and V tiles
++    const size_t slm_size = 4 * paged_attention_block_size * head_size * sizeof(uint16_t);
++    return slm_size <= info.max_local_mem_size;
++}
++
++// Speculative decoding validation step: MIXED stage where every subsequence has only a few new query tokens
++inline GQAMultiTokensKernel select_gqa_multi_tokens_kernel(const kernel_impl_params& params, const PagedAttentionStage& stage) {
++    if (stage != PagedAttentionStage::MIXED || !supports_gqa_multi_tokens_fallback_kernel(params))
++        return GQAMultiTokensKernel::NONE;
++
++    const auto max_tokens = get_max_gqa_multi_tokens_per_subsequence();
++    const auto max_subsequence_len = get_max_subsequence_len(params);
++    if (max_tokens <= 0 || max_subsequence_len > static_cast<size_t>(max_tokens))
++        return GQAMultiTokensKernel::NONE;
++
++    const auto forced = get_forced_gqa_multi_tokens_kernel();
++    if (forced == GQAMultiTokensKernel::NONE || forced == GQAMultiTokensKernel::FALLBACK)
++        return *forced;
++
++    if (!supports_gqa_multi_tokens_dpas_kernel(params))
++        return GQAMultiTokensKernel::FALLBACK;
++
++    if (forced != GQAMultiTokensKernel::SMALL_Q && prefer_gqa_multi_tokens_fallback_kernel(max_subsequence_len, get_max_context_len(params)))
++        return GQAMultiTokensKernel::FALLBACK;
++
++    const auto subgroups_num = ceil_div(max_subsequence_len, get_gqa_multi_tokens_per_sg(params));
++    if (subgroups_num * subgroup_size > params.get_device_info().max_work_group_size)
++        return GQAMultiTokensKernel::NONE;
++
++    return GQAMultiTokensKernel::SMALL_Q;
++}
++
++inline bool can_use_gqa_multi_tokens_kernel(const kernel_impl_params& params, const PagedAttentionStage& stage) {
++    return select_gqa_multi_tokens_kernel(params, stage) != GQAMultiTokensKernel::NONE;
++}
++
++inline void add_gqa_jit_constants(JitConstants& jit, const kernel_impl_params& params) {
++    const auto desc = params.typed_desc<paged_attention>();
++    const size_t kv_group_size = desc->heads_num / desc->kv_heads_num;
++    const auto heads_per_wi = get_heads_per_wi(kv_group_size);
++
++    jit.remove("HEADS_PER_WI");
++    jit.make("HEADS_PER_WI", heads_per_wi);
++    jit.make("ITERATIONS_PER_KV_HEADS_GROUP", ceil_div(kv_group_size, heads_per_wi));
++    jit.make("HEADS_LEFTOVERS_NUM", kv_group_size % heads_per_wi);
++}
++
++inline size_t get_gqa_heads_num(size_t heads_num, size_t kv_heads_num) {
++    const size_t kv_group_size = heads_num / kv_heads_num;
++    return kv_heads_num * ceil_div(kv_group_size, get_heads_per_wi(kv_group_size));
++}
++
+ static int64_t get_aligned_seq_len(const kernel_impl_params& impl_param, const PagedAttentionStage& stage, int64_t target_seq_len_block_size = 16) {
+     // Since at prefill stage Q, K, V inputs may contain multiple sequences with arbitrary
+     // target sequence lengths each (shape is [sequences_num * target_seq_len, num_heads * head_size]),
+@@ -199,14 +341,6 @@ static int64_t get_aligned_seq_len(const kernel_impl_params& impl_param, const P
+     return aligned_seq_len;
+ }
+ 
+-size_t get_max_context_len(const kernel_impl_params& params) {
+-    const auto& input_mem = params.memory_deps;
+-    const auto max_context_len = input_mem.at(PagedAttentionInputIdx::MAX_CONTEXT_LEN);
+-    mem_lock<int32_t, mem_lock_type::read> max_context_len_mem_lock(max_context_len, *params.strm);
+-    const auto paged_attention_max_len = max_context_len_mem_lock[0];
+-    return paged_attention_max_len;
+-}
+-
+ size_t get_partitioning_size(const kernel_impl_params& params, size_t head_size, PagedAttentionStage stage) {
+     size_t partition_size = 0;
+     if (stage == PagedAttentionStage::PREFILL) {
+@@ -283,6 +417,7 @@ JitConstants make_uint4_kv_cache_jit_constants(const kernel_impl_params& params)
+ class PagedAttentionGeneratorBase : public KernelGenerator {
+ public:
+     explicit PagedAttentionGeneratorBase(std::string_view stage_suffix) : KernelGenerator("paged_attention_opt", stage_suffix) {}
++    PagedAttentionGeneratorBase(std::string_view kernel_name, std::string_view stage_suffix) : KernelGenerator(kernel_name, stage_suffix) {}
+     [[nodiscard]] JitConstants get_jit_constants(const kernel_impl_params& params) const override {
+         auto jit = make_base_jit_constants(params);
+         auto desc = params.typed_desc<paged_attention>();
+@@ -510,17 +645,7 @@ public:
+ 
+     [[nodiscard]] JitConstants get_jit_constants(const kernel_impl_params& params) const override {
+         auto jit = PagedAttentionGeneratorSingleToken::get_jit_constants(params);
+-        const auto desc = params.typed_desc<paged_attention>();
+-        const size_t kv_group_size = desc->heads_num / desc->kv_heads_num;
+-        auto heads_per_wi = get_heads_per_wi(kv_group_size);
+-
+-        // GQA
+-        jit.remove("HEADS_PER_WI");
+-        jit.make("HEADS_PER_WI", heads_per_wi);
+-
+-        jit.make("ITERATIONS_PER_KV_HEADS_GROUP", ceil_div(kv_group_size, heads_per_wi));
+-        jit.make("HEADS_LEFTOVERS_NUM", kv_group_size % heads_per_wi);
+-
++        add_gqa_jit_constants(jit, params);
+         return jit;
+     }
+ 
+@@ -534,14 +659,11 @@ public:
+             const size_t total_tokens = params.input_layouts[0].get_partial_shape()[0].get_length();
+             const size_t heads_num = desc->heads_num;
+             const size_t v_head_size = desc->v_head_size;
+-            const size_t kv_group_size = desc->heads_num / desc->kv_heads_num;
+             const auto kv_cache_dt = params.get_program().get_config().get_kv_cache_precision();
+             const bool dual_nibble_v = can_use_dual_nibble_v(get_kv_compressed(params), kv_cache_dt, v_head_size);
+             const size_t head_size = dual_nibble_v ? v_head_size / u4_elems_per_byte : v_head_size;
+             auto sg_scale = get_pa_sg_number_scale_factor(params.get_device_info(), head_size, SDPAStage::SINGLE_TOKEN, get_kv_compressed(params));
+-            // GQA
+-            auto kv_groups = heads_num / kv_group_size;
+-            auto gqa_heads_num = kv_groups * ceil_div(kv_group_size, get_heads_per_wi(kv_group_size));
++            const auto gqa_heads_num = get_gqa_heads_num(heads_num, desc->kv_heads_num);
+             wgs.global = {total_tokens, gqa_heads_num, head_size * rtp->num_of_partitions * sg_scale};
+             wgs.local = {1, 1, head_size * sg_scale};
+         }};
+@@ -606,6 +728,7 @@ public:
+ class PagedAttentionGeneratorMultiTokens : public PagedAttentionGeneratorBase {
+ public:
+     PagedAttentionGeneratorMultiTokens() : PagedAttentionGeneratorBase("_multi_tokens") {}
++    PagedAttentionGeneratorMultiTokens(std::string_view kernel_name, std::string_view stage_suffix) : PagedAttentionGeneratorBase(kernel_name, stage_suffix) {}
+ 
+     [[nodiscard]] JitConstants get_jit_constants(const kernel_impl_params& params) const override {
+         auto jit = PagedAttentionGeneratorBase::get_jit_constants(params);
+@@ -714,6 +837,69 @@ public:
+     }
+ };
+ 
++// Speculative multi-token decode with GQA: one subgroup owns TOKENS_PER_SG query tokens x KV_HEADS_GROUP_SIZE heads
++// = 8 rows (the DPAS M tile); the K/V tile is dequantized into a single shared SLM buffer.
++class PagedAttentionGeneratorSmallQ : public PagedAttentionGeneratorMultiTokens {
++public:
++    PagedAttentionGeneratorSmallQ() : PagedAttentionGeneratorMultiTokens("pa_small_q_opt", "_gqa_multi_tokens") {}
++
++    [[nodiscard]] JitConstants get_jit_constants(const kernel_impl_params& params) const override {
++        auto jit = PagedAttentionGeneratorMultiTokens::get_jit_constants(params);
++        jit.make("TOKENS_PER_SG", get_gqa_multi_tokens_per_sg(params));
++        jit.make("SINGLE_KV_SLM", 1);
++        return jit;
++    }
++
++    [[nodiscard]] std::string get_build_options(const kernel_impl_params& params) const override {
++        return PagedAttentionGeneratorMultiTokens::get_build_options(params) + " -Dcl_intel_subgroup_matrix_multiply_accumulate";
++    }
++
++    [[nodiscard]] DispatchDataFunc get_dispatch_data_func() const override {
++        return DispatchDataFunc{[](const RuntimeParams& params, KernelData& kd, ImplRuntimeParams* rt_params) {
++            assert(!params.is_dynamic());
++            auto& wgs = kd.params.workGroups;
++            const auto desc = params.typed_desc<paged_attention>();
++            auto* rtp = static_cast<PagedAttentionRuntimeParams*>(rt_params);
++            const size_t subsequences_num = params.input_layouts[PagedAttentionInputIdx::PAST_LENS].get_partial_shape()[0].get_length();
++            const size_t local_size = ceil_div(get_max_subsequence_len(params), get_gqa_multi_tokens_per_sg(params)) * subgroup_size;
++
++            wgs.global = {subsequences_num, desc->kv_heads_num, local_size * rtp->num_of_partitions};
++            wgs.local = {1, 1, local_size};
++        }};
++    }
++};
++
++// Multi-token (speculative decoding) variant without DPAS, processing several query heads sharing one KV head per work-group
++class PagedAttentionGeneratorGQAMultiTokensFallback : public PagedAttentionGeneratorMultiTokens {
++public:
++    PagedAttentionGeneratorGQAMultiTokensFallback() : PagedAttentionGeneratorMultiTokens("paged_attention_opt", "_gqa_multi_tokens_fallback") {}
++
++    [[nodiscard]] JitConstants get_jit_constants(const kernel_impl_params& params) const override {
++        auto jit = PagedAttentionGeneratorMultiTokens::get_jit_constants(params);
++        add_gqa_jit_constants(jit, params);
++        return jit;
++    }
++
++    [[nodiscard]] DispatchDataFunc get_dispatch_data_func() const override {
++        return DispatchDataFunc{[](const RuntimeParams& params, KernelData& kd, ImplRuntimeParams* rt_params) {
++            assert(!params.is_dynamic());
++            auto& wgs = kd.params.workGroups;
++            const auto desc = params.typed_desc<paged_attention>();
++            auto* rtp = static_cast<PagedAttentionRuntimeParams*>(rt_params);
++            const size_t total_tokens = params.input_layouts[0].get_partial_shape()[0].get_length();
++            const size_t v_head_size = desc->v_head_size;
++            const auto kv_cache_dt = params.get_program().get_config().get_kv_cache_precision();
++            const bool dual_nibble_v = can_use_dual_nibble_v(get_kv_compressed(params), kv_cache_dt, v_head_size);
++            const size_t head_size = dual_nibble_v ? v_head_size / u4_elems_per_byte : v_head_size;
++
++            auto sg_scale = get_pa_sg_number_scale_factor(params.get_device_info(), head_size, SDPAStage::MULTI_TOKENS, get_kv_compressed(params));
++            const auto gqa_heads_num = get_gqa_heads_num(desc->heads_num, desc->kv_heads_num);
++            wgs.global = {total_tokens, gqa_heads_num, head_size * rtp->num_of_partitions * sg_scale};
++            wgs.local = {1, 1, head_size * sg_scale};
++        }};
++    }
++};
++
+ class PagedAttentionGeneratorMultiTokensFinalization : public PagedAttentionGeneratorBase {
+ public:
+     PagedAttentionGeneratorMultiTokensFinalization() : PagedAttentionGeneratorBase("_multi_tokens_finalization") {}
+@@ -1327,6 +1513,8 @@ public:
+     Stage::Ptr pa_gqa_single_token = make_stage<PagedAttentionGeneratorGQASingleToken>();
+     Stage::Ptr pa_single_token_finalization = make_stage<PagedAttentionGeneratorSingleTokenFinalization>();
+     Stage::Ptr pa_multi_token = make_stage<PagedAttentionGeneratorMultiTokens>();
++    Stage::Ptr pa_small_q = make_stage<PagedAttentionGeneratorSmallQ>();
++    Stage::Ptr pa_gqa_multi_token_fallback = make_stage<PagedAttentionGeneratorGQAMultiTokensFallback>();
+     Stage::Ptr pa_multi_token_finalization = make_stage<PagedAttentionGeneratorMultiTokensFinalization>();
+     Stage::Ptr pa_sdpa_opt = make_stage<PagedAttentionSDPAOptGeneratorMultiToken>();
+     Stage::Ptr kv_cache_rotate = make_stage<KVCacheRotateGenerator>();
+@@ -1354,6 +1542,12 @@ public:
+ 
+         add_stage(kv_cache_update, params);
+         add_stage(pa_multi_token, params);
++        if (supports_gqa_multi_tokens_dpas_kernel(params)) {
++            add_stage(pa_small_q, params);
++        }
++        if (supports_gqa_multi_tokens_fallback_kernel(params)) {
++            add_stage(pa_gqa_multi_token_fallback, params);
++        }
+         add_stage(pa_multi_token_finalization, params);
+         add_stage(pa_single_token, params);
+         add_stage(pa_gqa_single_token, params);
+@@ -1386,7 +1580,8 @@ public:
+     // only in the PREFILL kernels, and in MIXED neither micro SDPA nor paged_attention_opt.cl consumes token_type_ids.
+     // TODO: implement bidirectional attention for MIXED with token_type_ids
+     bool can_use_micro_sdpa_for(const kernel_impl_params& params, const PagedAttentionStage& stage) const {
+-        const auto can_use_micro_sdpa = supports_micro_sdpa(params) && valid_micro_stage(stage);
++        // Speculative decoding MIXED case is faster with the GQA multi-token kernel than with micro SDPA
++        const auto can_use_micro_sdpa = supports_micro_sdpa(params) && valid_micro_stage(stage) && !can_use_gqa_multi_tokens_kernel(params, stage);
+         GPU_DEBUG_TRACE_DETAIL << "can_use_micro_sdpa_for: stage = " << static_cast<size_t>(stage)
+                                << ", token_type_ids = " << params.get_input_layout(PagedAttentionInputIdx::TOKEN_TYPE_IDS).to_short_string()
+                                << ", can_use_micro_sdpa = " << can_use_micro_sdpa << std::endl;
+@@ -1519,17 +1714,32 @@ public:
+ 
+         rt_params->query_block_size = get_query_block_size(rt_params->stage, rt_params->use_micro_sdpa);
+ 
++        rt_params->gqa_multi_tokens_kernel = GQAMultiTokensKernel::NONE;
+         if (rt_params->stage == PagedAttentionStage::GENERATE) {
+             if (desc->has_sink_input) {
+                 rt_params->use_gqa_kernel = false;
+             } else {
+                 rt_params->use_gqa_kernel = can_use_gqa_kernel(params, PagedAttentionStage::GENERATE, rt_params->max_context_len);
+             }
++        } else if (rt_params->stage == PagedAttentionStage::MIXED && !rt_params->use_micro_sdpa) {
++            rt_params->gqa_multi_tokens_kernel = select_gqa_multi_tokens_kernel(params, rt_params->stage);
++            rt_params->use_gqa_kernel = rt_params->gqa_multi_tokens_kernel != GQAMultiTokensKernel::NONE;
+         } else {
+             rt_params->use_gqa_kernel = false;
+         }
+     }
+ 
++    Stage::Ptr& get_gqa_multi_token_stage(GQAMultiTokensKernel kernel) {
++        switch (kernel) {
++        case GQAMultiTokensKernel::SMALL_Q:
++            return pa_small_q;
++        case GQAMultiTokensKernel::FALLBACK:
++            return pa_gqa_multi_token_fallback;
++        default:
++            OPENVINO_THROW("[GPU] Unexpected GQA multi-token kernel for PagedAttention");
++        }
++    }
++
+     // update impl_parameter and rt_parameter
+     void update(primitive_inst& inst, const kernel_impl_params& impl_params) override {
+         SDPAImplBase::update(inst, impl_params);
+@@ -1570,7 +1780,9 @@ public:
+             const auto multi_tokens_mode = rt_params->stage == PagedAttentionStage::MIXED;
+             auto num_of_partitions = rt_params->num_of_partitions;
+             if (rt_params->use_gqa_kernel && !rt_params->use_micro_sdpa) {
+-                res_event = {execute_stage(res_event, instance, multi_tokens_mode ? pa_multi_token : pa_gqa_single_token)};
++                res_event = {execute_stage(res_event,
++                                           instance,
++                                           multi_tokens_mode ? get_gqa_multi_token_stage(rt_params->gqa_multi_tokens_kernel) : pa_gqa_single_token)};
+             } else {
+ #ifdef ENABLE_ONEDNN_FOR_GPU
+                 if (multi_tokens_mode && rt_params->use_micro_sdpa)
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa/paged_attention_opt.hpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa/paged_attention_opt.hpp
+index 0211778b..c901f323 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa/paged_attention_opt.hpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa/paged_attention_opt.hpp
+@@ -19,6 +19,9 @@ namespace ov::intel_gpu::ocl {
+ 
+ enum class PagedAttentionStage : uint8_t { GENERATE = 0, PREFILL = 1, MIXED = 2, UNKNOWN = 3 };
+ 
++// Kernel used for MIXED stage with few query tokens per subsequence (speculative decoding)
++enum class GQAMultiTokensKernel : uint8_t { NONE = 0, SMALL_Q = 1, FALLBACK = 2 };
++
+ struct PagedAttentionRuntimeParams : public ImplRuntimeParams {
+     PagedAttentionStage stage;
+     size_t num_of_partitions;
+@@ -30,6 +33,7 @@ struct PagedAttentionRuntimeParams : public ImplRuntimeParams {
+     size_t paged_attention_snap_kv_tokens;
+     bool use_micro_sdpa = false;
+     bool use_gqa_kernel = false;
++    GQAMultiTokensKernel gqa_multi_tokens_kernel = GQAMultiTokensKernel::NONE;
+     size_t query_block_size = 16;
+ };
+ 
+diff --git a/src/plugins/intel_gpu/src/plugin/ops/constant.cpp b/src/plugins/intel_gpu/src/plugin/ops/constant.cpp
+index 0141f412..8e9f73c5 100644
+--- a/src/plugins/intel_gpu/src/plugin/ops/constant.cpp
++++ b/src/plugins/intel_gpu/src/plugin/ops/constant.cpp
+@@ -2,6 +2,13 @@
+ // SPDX-License-Identifier: Apache-2.0
+ //
+ 
++#include <algorithm>
++#include <cstdlib>
++#include <cstring>
++#include <system_error>
++#include <thread>
++#include <vector>
++
+ #include "intel_gpu/plugin/program_builder.hpp"
+ #include "intel_gpu/plugin/common_utils.hpp"
+ #include "intel_gpu/op/convolution.hpp"
+@@ -84,6 +91,49 @@ struct ConstProperties {
+     bool needsBatchInterpretation;
+ };
+ 
++// [backport-long-ctx] Local equivalent of upstream "Prefetch constants during model compilation" (#38993, #39493),
++// whose core-side API (ov::util::OrderedPrefetchScheduler) does not exist in the 2026.4.1 runtime this plugin is
++// loaded into. Large constants are copied from the mmap-ed (usually not yet resident) model file into GPU memory by
++// several threads, so the page-in of the source and the first touch of the destination are not serialized on one thread.
++// OV_GPU_CONST_COPY_THREADS=N overrides the thread count (0 or 1 restores the single-threaded memcpy).
++static size_t const_copy_threads() {
++    static const size_t value = [] {
++        if (const char* env = std::getenv("OV_GPU_CONST_COPY_THREADS")) {
++            return static_cast<size_t>(std::max(0l, std::strtol(env, nullptr, 10)));
++        }
++        const size_t hw = std::thread::hardware_concurrency();
++        return std::min<size_t>(8, std::max<size_t>(1, hw / 2));
++    }();
++    return value;
++}
++
++static void copy_constant_data(char* dst, const char* src, size_t size) {
++    // 1 MiB per thread at least: most compressed FC weights of an LLM are 10-50 MiB each.
++    constexpr size_t min_chunk = size_t{1} << 20;
++    const size_t threads = std::min(const_copy_threads(), size / min_chunk);
++    if (threads <= 1) {
++        std::memcpy(dst, src, size);
++        return;
++    }
++    const size_t chunk = ((size / threads) + 4095) & ~size_t{4095};
++    std::vector<std::thread> workers;
++    workers.reserve(threads);
++    for (size_t offset = chunk; offset < size; offset += chunk) {
++        const size_t len = std::min(chunk, size - offset);
++        try {
++            workers.emplace_back([=] {
++                std::memcpy(dst + offset, src + offset, len);
++            });
++        } catch (const std::system_error&) {
++            std::memcpy(dst + offset, src + offset, len);
++        }
++    }
++    std::memcpy(dst, src, std::min(chunk, size));
++    for (auto& worker : workers) {
++        worker.join();
++    }
++}
++
+ static void create_data(ProgramBuilder& p, const ov::Shape& const_shape, const std::shared_ptr<ov::op::v0::Constant>& op, const ConstProperties& props) {
+     cldnn::tensor constTensor = getConstTensor(const_shape);
+     auto constFormat = cldnn::format::get_default_format(const_shape.size());
+@@ -162,7 +212,7 @@ static void create_data(ProgramBuilder& p, const ov::Shape& const_shape, const s
+                     }
+                 }
+             } else {
+-                std::memcpy(&buf[0], &data[0], bufSize);
++                copy_constant_data(&buf[0], &data[0], bufSize);
+             }
+         }
+         ov::wsh::Extension::hint_evict(*op);
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/pa_small_q_opt.cl b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/pa_small_q_opt.cl
+new file mode 100644
+index 00000000..62de6b56
+--- /dev/null
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/pa_small_q_opt.cl
+@@ -0,0 +1,406 @@
++// Copyright (C) 2018-2026 Intel Corporation
++// SPDX-License-Identifier: Apache-2.0
++//
++
++// PagedAttention for the MIXED stage with a few query tokens per subsequence (speculative decoding).
++// A work-group processes one subsequence x one KV head x one partition. Each subgroup owns
++// TOKENS_PER_SG query tokens x KV_HEADS_GROUP_SIZE heads = 8 rows (the DPAS M tile), so QK^T and P@V
++// both run on DPAS with online softmax in registers. The dequantized K/V tile is shared through SLM.
++// Partial results per partition are merged by paged_attention_opt.cl (SDPA_STAGE_1, MULTI_TOKENS_PROCESSING).
++
++#include "include/batch_headers/common.cl"
++
++#if HAS_SINK_INPUT || PAGED_ATTENTION_SCORES_OUTPUT
++    #error "pa_small_q_opt.cl: sink input and scores output are not supported"
++#endif
++
++#if K_HEAD_SIZE != V_HEAD_SIZE || K_HEAD_SIZE % 32 != 0
++    #error "pa_small_q_opt.cl: K and V head sizes must be equal and a multiple of 32"
++#endif
++
++#if SUBGROUP_SIZE != 16 || PAGED_ATTENTION_BLOCK_SIZE != 16
++    #error "pa_small_q_opt.cl: SUBGROUP_SIZE and PAGED_ATTENTION_BLOCK_SIZE must be 16"
++#endif
++
++#if TOKENS_PER_SG * KV_HEADS_GROUP_SIZE != 8
++    #error "pa_small_q_opt.cl: each subgroup must own exactly 8 query rows"
++#endif
++
++#if SEQ_LEN_PARTITION_SIZE % PAGED_ATTENTION_BLOCK_SIZE != 0
++    #error "pa_small_q_opt.cl: SEQ_LEN_PARTITION_SIZE must be a multiple of PAGED_ATTENTION_BLOCK_SIZE"
++#endif
++
++#define HEAD_SIZE K_HEAD_SIZE
++#define BLOCK PAGED_ATTENTION_BLOCK_SIZE
++#define CHUNKS (HEAD_SIZE / SUBGROUP_SIZE)
++#define ROWS 8
++#define QUERY_ROW_STRIDE (K_HEAD_SIZE * HEADS_NUM + INPUT0_PAD_BEFORE_FEATURE_NUM + INPUT0_PAD_AFTER_FEATURE_NUM)
++
++#if IS_KV_COMPRESSED && IS_INT4_COMPRESSED
++    #define K_BLOCK_ELEMS (PACKED_ADJUSTED_K_HEAD_SIZE * ADJUSTED_PAGED_ATTENTION_BLOCK_SIZE)
++    #define V_BLOCK_ELEMS (PACKED_ADJUSTED_V_HEAD_SIZE * BLOCK)
++#else
++    #define K_BLOCK_ELEMS (ADJUSTED_K_HEAD_SIZE * ADJUSTED_PAGED_ATTENTION_BLOCK_SIZE)
++    #define V_BLOCK_ELEMS (ADJUSTED_V_HEAD_SIZE * BLOCK)
++#endif
++
++// Writes the K tile transposed to [token][head_dim] so each lane (key token) reads a contiguous DPAS B operand
++inline void FUNC(dequant_key)(const __global INPUT1_TYPE* key_block, __local half* dst, uint lid, uint local_size) {
++#if !IS_KV_COMPRESSED
++    for (uint d = lid; d < HEAD_SIZE; d += local_size) {
++        unroll_for (uint t = 0; t < BLOCK; t++) {
++            dst[t * HEAD_SIZE + d] = key_block[d * BLOCK + t];
++        }
++    }
++#elif IS_INT4_COMPRESSED && defined(IS_KEY_BY_CHANNEL)
++    const __global uchar* key_bytes = (const __global uchar*)key_block;
++    for (uint d = lid; d < HEAD_SIZE; d += local_size) {
++        const __global uchar* row = key_bytes + d * ADJUSTED_PAGED_ATTENTION_BLOCK_SIZE;
++        const __global INPUT0_TYPE* comp = (const __global INPUT0_TYPE*)(row + PACKED_K_BLOCK_SIZE);
++        const float comp_scale = convert_float(comp[0]);
++        const float comp_zp = convert_float(comp[1]);
++        const ulong packed = as_ulong(vload8(0, row));
++        unroll_for (uint i = 0; i < PACKED_K_BLOCK_SIZE; i++) {
++            const uint codes = (uint)((packed >> (i * 8)) & 0xfful);
++            dst[(2 * i) * HEAD_SIZE + d] = convert_half(((float)(codes & 15u) - comp_zp) * comp_scale);
++            dst[(2 * i + 1) * HEAD_SIZE + d] = convert_half(((float)(codes >> 4) - comp_zp) * comp_scale);
++        }
++    }
++#elif IS_INT4_COMPRESSED
++    const __global uchar* key_bytes = (const __global uchar*)key_block;
++    const __global INPUT0_TYPE* comp = (const __global INPUT0_TYPE*)(key_bytes + PACKED_K_HEAD_SIZE * BLOCK);
++    for (uint packed_dim = lid; packed_dim < HEAD_SIZE / 2; packed_dim += local_size) {
++        unroll_for (uint t = 0; t < BLOCK; t++) {
++            const uint codes = key_bytes[packed_dim * BLOCK + t];
++            const float comp_scale = convert_float(comp[t]);
++            const float comp_zp = convert_float(comp[BLOCK + t]);
++            dst[t * HEAD_SIZE + 2 * packed_dim] = convert_half(((float)(codes & 15u) - comp_zp) * comp_scale);
++            dst[t * HEAD_SIZE + 2 * packed_dim + 1] = convert_half(((float)(codes >> 4) - comp_zp) * comp_scale);
++        }
++    }
++#elif defined(IS_KEY_BY_CHANNEL)
++    const __global char* key_bytes = (const __global char*)key_block;
++    for (uint d = lid; d < HEAD_SIZE; d += local_size) {
++        const __global char* row = key_bytes + d * ADJUSTED_PAGED_ATTENTION_BLOCK_SIZE;
++        const __global INPUT0_TYPE* comp = (const __global INPUT0_TYPE*)(row + BLOCK);
++        const float comp_scale = convert_float(comp[0]);
++        const float comp_zp = convert_float(comp[1]);
++        unroll_for (uint t = 0; t < BLOCK; t++) {
++            dst[t * HEAD_SIZE + d] = convert_half(((float)row[t] - comp_zp) * comp_scale);
++        }
++    }
++#else
++    const __global char* key_bytes = (const __global char*)key_block;
++    const __global INPUT0_TYPE* comp = (const __global INPUT0_TYPE*)(key_bytes + HEAD_SIZE * BLOCK);
++    for (uint d = lid; d < HEAD_SIZE; d += local_size) {
++        unroll_for (uint t = 0; t < BLOCK; t++) {
++            const float comp_scale = convert_float(comp[t]);
++            const float comp_zp = convert_float(comp[BLOCK + t]);
++            dst[t * HEAD_SIZE + d] = convert_half(((float)key_bytes[d * BLOCK + t] - comp_zp) * comp_scale);
++        }
++    }
++#endif
++}
++
++// Writes the V tile transposed to [head_dim][token] so each lane (head dim) reads a contiguous DPAS B operand.
++// Rows at or beyond valid_tokens are zeroed: they may hold uninitialized data (NaN/Inf) and P.V would compute 0 * NaN.
++inline void FUNC(dequant_value)(const __global INPUT2_TYPE* value_block, __local half* dst, uint lid, uint local_size, uint valid_tokens) {
++    for (uint slot = lid; slot < BLOCK * CHUNKS; slot += local_size) {
++        const uint token = slot / CHUNKS;
++        const uint dim_base = (slot % CHUNKS) * SUBGROUP_SIZE;
++        if (token >= valid_tokens) {
++            unroll_for (uint j = 0; j < SUBGROUP_SIZE; j++) {
++                dst[(dim_base + j) * BLOCK + token] = 0;
++            }
++            continue;
++        }
++#if !IS_KV_COMPRESSED
++        const __global INPUT2_TYPE* row = value_block + token * HEAD_SIZE;
++        unroll_for (uint j = 0; j < SUBGROUP_SIZE; j++) {
++            dst[(dim_base + j) * BLOCK + token] = row[dim_base + j];
++        }
++#elif IS_INT4_COMPRESSED
++        const __global uchar* row = (const __global uchar*)value_block + token * PACKED_ADJUSTED_V_HEAD_SIZE;
++        const __global INPUT0_TYPE* comp = (const __global INPUT0_TYPE*)(row + PACKED_V_HEAD_SIZE);
++        const float comp_scale = convert_float(comp[0]);
++        const float comp_zp = convert_float(comp[1]);
++        const ulong packed = as_ulong(vload8(0, row + dim_base / 2));
++        unroll_for (uint i = 0; i < SUBGROUP_SIZE / 2; i++) {
++            const uint codes = (uint)((packed >> (i * 8)) & 0xfful);
++            const uint dim = dim_base + 2 * i;
++            dst[dim * BLOCK + token] = convert_half(((float)(codes & 15u) - comp_zp) * comp_scale);
++            dst[(dim + 1) * BLOCK + token] = convert_half(((float)(codes >> 4) - comp_zp) * comp_scale);
++        }
++#else
++        const __global char* value_bytes = (const __global char*)value_block;
++        const __global char* row = value_bytes + token * HEAD_SIZE;
++        const __global INPUT0_TYPE* comp = (const __global INPUT0_TYPE*)(value_bytes + HEAD_SIZE * BLOCK);
++        const float comp_scale = convert_float(comp[token]);
++        const float comp_zp = convert_float(comp[BLOCK + token]);
++        unroll_for (uint j = 0; j < SUBGROUP_SIZE; j++) {
++            dst[(dim_base + j) * BLOCK + token] = convert_half(((float)row[dim_base + j] - comp_zp) * comp_scale);
++        }
++#endif
++    }
++}
++
++REQD_SUB_GROUP_SIZE(SUBGROUP_SIZE)
++KERNEL(pa_small_q_opt)(
++    OPTIONAL_SHAPE_INFO_ARG
++    const __global INPUT0_TYPE* query,
++    const __global INPUT1_TYPE* key_cache,
++    const __global INPUT2_TYPE* value_cache,
++    const __global INPUT3_TYPE* past_lens,
++    const __global INPUT4_TYPE* block_indices,
++    const __global INPUT5_TYPE* block_indices_begins,
++    const __global INPUT6_TYPE* subsequence_begins,
++#if HAS_SCALE_INPUT
++    const __global SCALE_INPUT_TYPE* scale,
++#endif
++#if HAS_ALIBI
++    const __global ALIBI_INPUT_TYPE* alibi_slopes,
++#endif
++#if HAS_QQ_BIAS
++    const __global QQ_BIAS_DATA_T* qq_bias,
++    const __global QQ_BIAS_BEGINS_DATA_T* qq_bias_begins,
++#endif
++    __global OUTPUT_TYPE* output,
++    __global SOFTMAX_ACCUMULATOR_TYPE* exp_sums,
++    __global SOFTMAX_ACCUMULATOR_TYPE* max_logits,
++    __global OUTPUT_TYPE* tmp_out,
++    __global const int* gws_subseq_mapping
++) {
++    // query: [total_tokens, HEADS_NUM * K_HEAD_SIZE]
++    // output: [total_tokens, HEADS_NUM * V_HEAD_SIZE]
++    // exp_sums / max_logits: [total_tokens, HEADS_NUM, total_partitions_num]
++    // tmp_out: [total_tokens, HEADS_NUM, total_partitions_num, V_HEAD_SIZE]
++    const uint lid = get_local_id(2);
++    const uint local_size = get_local_size(2);
++    const uint sgid = get_sub_group_id();
++    const uint sglid = get_sub_group_local_id();
++    const uint subsequence_idx = get_group_id(0);
++    const uint kv_head_idx = get_group_id(1);
++    const uint partition_idx = get_group_id(2);
++    const uint total_partitions_num = get_num_groups(2);
++
++    const uint query_begin = subsequence_begins[subsequence_idx];
++    const uint query_count = subsequence_begins[subsequence_idx + 1] - query_begin;
++    if (query_count == 0)
++        return;
++
++    const uint past_len = past_lens[subsequence_idx];
++    const uint context_len = past_len + query_count;
++    const uint block_table_begin = block_indices_begins[subsequence_idx];
++    const uint head_begin = kv_head_idx * KV_HEADS_GROUP_SIZE;
++    const uint partition_start = partition_idx * SEQ_LEN_PARTITION_SIZE;
++
++#ifdef SCALE_VAL
++    const float scale_val = SCALE_VAL;
++#else
++    const float scale_val = convert_float(scale[0]);
++#endif
++
++#if HAS_QQ_BIAS
++    const uint qq_bias_num = qq_bias_begins[subsequence_idx + 1] - qq_bias_begins[subsequence_idx];
++    const uint qq_bias_spec_num = (uint)native_sqrt((float)qq_bias_num);
++    const uint cumulated_qq_bias_num = qq_bias_begins[subsequence_idx];
++#endif
++
++#ifdef SINGLE_KV_SLM
++    // K and V of a tile share one buffer: halves SLM per work-group at the cost of two extra barriers per tile
++    __local half kv_slm[BLOCK * HEAD_SIZE] __attribute__((aligned(64)));
++#else
++    // Double-buffered so that dequantization of the next tile does not wait for readers of the current one
++    __local half k_slm[2 * BLOCK * HEAD_SIZE] __attribute__((aligned(64)));
++    __local half v_slm[2 * HEAD_SIZE * BLOCK] __attribute__((aligned(64)));
++#endif
++
++    // DPAS A operand: lane holds head dim (c * SUBGROUP_SIZE + sglid) of each row.
++    // Rows beyond query_count clamp to the first token and are masked out below.
++    short8 q_cache[CHUNKS];
++    unroll_for (uint c = 0; c < CHUNKS; c++) {
++        half8 q;
++        unroll_for (uint m = 0; m < ROWS; m++) {
++            const uint token_off = sgid * TOKENS_PER_SG + m / KV_HEADS_GROUP_SIZE;
++            const uint token = query_begin + (token_off < query_count ? token_off : 0);
++            const uint head = head_begin + m % KV_HEADS_GROUP_SIZE;
++            q[m] = query[INPUT0_OFFSET + token * QUERY_ROW_STRIDE + head * HEAD_SIZE + c * SUBGROUP_SIZE + sglid];
++        }
++        q_cache[c] = as_short8(q);
++    }
++
++    float8 acc[CHUNKS];
++    unroll_for (uint c = 0; c < CHUNKS; c++) {
++        acc[c] = (float8)(0.0f);
++    }
++    float8 row_max = (float8)(-INFINITY);
++    float8 row_sum = (float8)(0.0f);
++
++    // The first query row defines the union of keys needed by this subsequence's sliding windows.
++    uint tile_start = partition_start;
++#if SLIDING_WINDOW_SIZE != 0
++    const uint first_query_seq_len = past_len + 1;
++    if (first_query_seq_len > SLIDING_WINDOW_SIZE) {
++        const uint window_start = first_query_seq_len - SLIDING_WINDOW_SIZE;
++        tile_start = max(tile_start, (window_start / BLOCK) * BLOCK);
++    }
++#endif
++
++    uint tile_count = 0;
++    const uint partition_end = partition_start + SEQ_LEN_PARTITION_SIZE;
++    if (tile_start < context_len && tile_start < partition_end) {
++        const uint partition_remaining = partition_end - tile_start;
++        tile_count = min((uint)(partition_remaining / BLOCK), (uint)CEIL_DIV(context_len - tile_start, BLOCK));
++    }
++
++    // Prefetch the next tile's block-table entry so its dependent global load overlaps this tile's
++    // compute instead of stalling each iteration's dequant (matters most for long context / many tiles).
++    uint physical_block = tile_count ? (uint)block_indices[block_table_begin + tile_start / BLOCK] : 0;
++
++    for (uint tile = 0; tile < tile_count; tile++) {
++        const uint key_start = tile_start + tile * BLOCK;
++        const uint valid_tokens = min((uint)BLOCK, context_len - key_start);
++        const __global INPUT1_TYPE* key_block = key_cache + physical_block * KV_HEADS_NUM * K_BLOCK_ELEMS + kv_head_idx * K_BLOCK_ELEMS;
++        const __global INPUT2_TYPE* value_block = value_cache + physical_block * KV_HEADS_NUM * V_BLOCK_ELEMS + kv_head_idx * V_BLOCK_ELEMS;
++        if (tile + 1 < tile_count)
++            physical_block = (uint)block_indices[block_table_begin + (key_start + BLOCK) / BLOCK];
++#ifdef SINGLE_KV_SLM
++        __local half* k_cur = kv_slm;
++        __local half* v_cur = kv_slm;
++        // Previous tile's P.V reads must finish before K overwrites the buffer
++        if (tile > 0)
++            barrier(CLK_LOCAL_MEM_FENCE);
++        FUNC_CALL(dequant_key)(key_block, k_cur, lid, local_size);
++#else
++        __local half* k_cur = k_slm + (tile & 1) * (BLOCK * HEAD_SIZE);
++        __local half* v_cur = v_slm + (tile & 1) * (HEAD_SIZE * BLOCK);
++        FUNC_CALL(dequant_key)(key_block, k_cur, lid, local_size);
++        FUNC_CALL(dequant_value)(value_block, v_cur, lid, local_size, valid_tokens);
++#endif
++        barrier(CLK_LOCAL_MEM_FENCE);
++
++        // S[8 rows, 16 key tokens] = Q . K^T. Interleave the SLM load with the MAD to overlap load latency.
++        float8 s = (float8)(0.0f);
++        for (uint c = 0; c < CHUNKS; c += 2) {
++            const int8 k0 = vload8(sglid * CHUNKS + c, (const __local int*)k_cur);
++            s = intel_sub_group_f16_f16_matrix_mad_k16(q_cache[c], k0, s);
++            const int8 k1 = vload8(sglid * CHUNKS + c + 1, (const __local int*)k_cur);
++            s = intel_sub_group_f16_f16_matrix_mad_k16(q_cache[c + 1], k1, s);
++        }
++        s *= (float8)(scale_val);
++
++        // Lane owns key token key_pos; the causal length differs per row
++        const uint key_pos = key_start + sglid;
++        float scores[ROWS];
++        vstore8(s, 0, scores);
++        unroll_for (uint m = 0; m < ROWS; m++) {
++            const uint token_off = sgid * TOKENS_PER_SG + m / KV_HEADS_GROUP_SIZE;
++            const uint seq_len = past_len + token_off + 1;
++            bool valid = token_off < query_count && key_pos < seq_len;
++#if SLIDING_WINDOW_SIZE != 0
++            valid = valid && !(seq_len > SLIDING_WINDOW_SIZE && key_pos < seq_len - SLIDING_WINDOW_SIZE);
++#endif
++#if HAS_QQ_BIAS
++            // Speculative tree mask between draft tokens of the same subsequence
++            if (valid && qq_bias_num > 0 && key_pos >= past_len) {
++                const uint spec_offset = key_pos - past_len;
++                if (spec_offset < qq_bias_spec_num && qq_bias[cumulated_qq_bias_num + token_off * qq_bias_spec_num + spec_offset] == 0)
++                    valid = false;
++            }
++#endif
++#if HAS_ALIBI
++            scores[m] += convert_float(alibi_slopes[head_begin + m % KV_HEADS_GROUP_SIZE]) * ((int)key_pos + 1 - (int)seq_len);
++#endif
++            if (!valid)
++                scores[m] = -INFINITY;
++        }
++
++        // Online softmax; reductions are uniform across the subgroup
++        float tile_max[ROWS];
++        unroll_for (uint m = 0; m < ROWS; m++) {
++            tile_max[m] = sub_group_reduce_max(scores[m]);
++        }
++        const float8 new_max = fmax(row_max, vload8(0, tile_max));
++        const bool rescale_needed = any(new_max != row_max);
++        const float8 old_scale = select(native_exp(row_max - new_max), (float8)(0.0f), isinf(row_max));
++        const float8 p = select(native_exp(vload8(0, scores) - new_max), (float8)(0.0f), isinf(new_max));
++
++        float p_arr[ROWS];
++        vstore8(p, 0, p_arr);
++        float tile_sum[ROWS];
++        unroll_for (uint m = 0; m < ROWS; m++) {
++            tile_sum[m] = sub_group_reduce_add(p_arr[m]);
++        }
++        row_sum = row_sum * old_scale + vload8(0, tile_sum);
++        row_max = new_max;
++
++        if (rescale_needed) {
++            unroll_for (uint c = 0; c < CHUNKS; c++) {
++                acc[c] *= old_scale;
++            }
++        }
++
++#ifdef SINGLE_KV_SLM
++        barrier(CLK_LOCAL_MEM_FENCE);
++        FUNC_CALL(dequant_value)(value_block, v_cur, lid, local_size, valid_tokens);
++        barrier(CLK_LOCAL_MEM_FENCE);
++#endif
++
++        // O[8 rows, head dims] += P . V; A operand lane == key token
++        const short8 p_half = as_short8(convert_half8(p));
++        for (uint c = 0; c < CHUNKS; c += 2) {
++            const int8 v0 = vload8(c * SUBGROUP_SIZE + sglid, (const __local int*)v_cur);
++            acc[c] = intel_sub_group_f16_f16_matrix_mad_k16(p_half, v0, acc[c]);
++            const int8 v1 = vload8((c + 1) * SUBGROUP_SIZE + sglid, (const __local int*)v_cur);
++            acc[c + 1] = intel_sub_group_f16_f16_matrix_mad_k16(p_half, v1, acc[c + 1]);
++        }
++        // Double buffer needs no trailing barrier: the next write to this buffer happens after the next tile's barrier,
++        // which every subgroup reaches only after finishing this tile.
++    }
++
++    float max_arr[ROWS];
++    float sum_arr[ROWS];
++    vstore8(row_max, 0, max_arr);
++    vstore8(row_sum, 0, sum_arr);
++
++    unroll_for (uint m = 0; m < ROWS; m++) {
++        const uint token_off = sgid * TOKENS_PER_SG + m / KV_HEADS_GROUP_SIZE;
++        if (token_off >= query_count)
++            continue;
++
++        const uint seq_len = past_len + token_off + 1;
++        const uint token = query_begin + token_off;
++        const uint head = head_begin + m % KV_HEADS_GROUP_SIZE;
++        const float denom = sum_arr[m];
++        const float inv_denom = denom > 0.0f ? 1.0f / denom : 0.0f;
++
++        // The finalization stage skips tokens fitting into a single partition, so those are written to output directly
++        if (seq_len > SEQ_LEN_PARTITION_SIZE) {
++            if (sglid == 0) {
++                const uint exp_sums_offset = token * HEADS_NUM * total_partitions_num + head * total_partitions_num + partition_idx;
++                exp_sums[exp_sums_offset] = denom;
++                // Finite for fully masked partitions so finalization's exp(max - global_max) never sees -inf
++                max_logits[exp_sums_offset] = isinf(max_arr[m]) ? SOFTMAX_ACCUMULATOR_VAL_MIN : max_arr[m];
++            }
++            const uint tmp_out_offset = token * (HEADS_NUM * V_HEAD_SIZE * total_partitions_num) +
++                                        head * (V_HEAD_SIZE * total_partitions_num) +
++                                        partition_idx * V_HEAD_SIZE;
++            unroll_for (uint c = 0; c < CHUNKS; c++) {
++                tmp_out[tmp_out_offset + c * SUBGROUP_SIZE + sglid] = TO_OUTPUT_TYPE(acc[c][m] * inv_denom);
++            }
++        } else if (partition_idx == 0) {
++            const uint output_offset = token * (HEADS_NUM * V_HEAD_SIZE) + head * V_HEAD_SIZE;
++            unroll_for (uint c = 0; c < CHUNKS; c++) {
++                output[output_offset + c * SUBGROUP_SIZE + sglid] = TO_OUTPUT_TYPE(acc[c][m] * inv_denom);
++            }
++        }
++    }
++}
++
++#undef HEAD_SIZE
++#undef BLOCK
++#undef CHUNKS
++#undef ROWS
++#undef QUERY_ROW_STRIDE
++#undef K_BLOCK_ELEMS
++#undef V_BLOCK_ELEMS
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_gated_delta_net_jit_utils.hpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_gated_delta_net_jit_utils.hpp
+new file mode 100644
+index 00000000..93cf5069
+--- /dev/null
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_gated_delta_net_jit_utils.hpp
+@@ -0,0 +1,93 @@
++// Copyright (C) 2018-2026 Intel Corporation
++// SPDX-License-Identifier: Apache-2.0
++//
++
++#pragma once
++
++#include <cstddef>
++
++#include "intel_gpu/runtime/device_info.hpp"
++
++namespace ov::intel_gpu::ocl::paged_gated_delta_net_jit {
++
++inline size_t get_subgroup_size(cldnn::gpu_arch arch) {
++    switch (arch) {
++    case cldnn::gpu_arch::gen9:
++    case cldnn::gpu_arch::gen11:
++    case cldnn::gpu_arch::xe_lp:
++    case cldnn::gpu_arch::xe_hp:
++    case cldnn::gpu_arch::xe_hpg:
++        return 8;
++    case cldnn::gpu_arch::xe2:
++    case cldnn::gpu_arch::xe3:
++    default:
++        return 16;
++    }
++}
++
++// The 256-register mode exists from Xe-HP on. Earlier parts run with 128.
++inline bool supports_large_grf(cldnn::gpu_arch arch) {
++    switch (arch) {
++    case cldnn::gpu_arch::gen9:
++    case cldnn::gpu_arch::gen11:
++    case cldnn::gpu_arch::xe_lp:
++        return false;
++    default:
++        return true;
++    }
++}
++
++inline size_t get_grf_bytes(cldnn::gpu_arch arch) {
++    switch (arch) {
++    case cldnn::gpu_arch::gen9:
++    case cldnn::gpu_arch::gen11:
++    case cldnn::gpu_arch::xe_lp:
++    case cldnn::gpu_arch::xe_hp:
++    case cldnn::gpu_arch::xe_hpg:
++        return 32;
++    default:
++        return 64;
++    }
++}
++
++// Floats per lane in a thread's register file: its size divided by the subgroup
++// width.
++inline size_t get_lane_float_capacity(cldnn::gpu_arch arch) {
++    const size_t grf_regs = supports_large_grf(arch) ? 256 : 128;
++    return grf_regs * get_grf_bytes(arch) / (get_subgroup_size(arch) * sizeof(float));
++}
++
++// d_v-on-lanes keeps k_head_dims floats of state per lane. It needs the large
++// register file and applies while those are at most half of the lane's floats
++// in it; above that the k axis goes on the lanes instead.
++inline bool uses_d_on_lanes(size_t k_head_dims, cldnn::gpu_arch arch) {
++    return !supports_large_grf(arch) || k_head_dims > get_lane_float_capacity(arch) / 2;
++}
++
++// v rows a subgroup covers under d-on-lanes, where the count can be chosen
++// (under d_v-on-lanes it is the subgroup width).
++//
++// The floats a lane needs are estimated as the sum of
++//   v_rows * lane_elems   for the state,
++//   4 * lane_elems        for q and k of this token and the next,
++//   32                    a margin, set from spill audits, for everything else.
++// v_rows starts at 8, so that few subgroups read the same q and k rows, and is
++// halved, down to 1, while the estimate reaches the lane's floats in the
++// register file.
++inline size_t get_d_on_lanes_v_rows(size_t k_head_dims, cldnn::gpu_arch arch) {
++    const size_t lane_elems = k_head_dims / get_subgroup_size(arch);
++    const size_t capacity = get_lane_float_capacity(arch);
++    size_t v_rows = 8;
++    while (v_rows > 1 && (v_rows + 4) * lane_elems + 32 >= capacity) {
++        v_rows /= 2;
++    }
++    return v_rows;
++}
++
++// v rows a subgroup covers. Under d_v-on-lanes each lane holds one v row, so
++// this is the subgroup width.
++inline size_t get_v_rows_per_thread(size_t k_head_dims, cldnn::gpu_arch arch) {
++    return uses_d_on_lanes(k_head_dims, arch) ? get_d_on_lanes_v_rows(k_head_dims, arch) : get_subgroup_size(arch);
++}
++
++}  // namespace ov::intel_gpu::ocl::paged_gated_delta_net_jit
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_gated_delta_net_short.cl b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_gated_delta_net_short.cl
+new file mode 100644
+index 00000000..9a700043
+--- /dev/null
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_gated_delta_net_short.cl
+@@ -0,0 +1,281 @@
++// Copyright (C) 2018-2026 Intel Corporation
++// SPDX-License-Identifier: Apache-2.0
++//
++
++// Gated delta rule, S_t = a_t S_{t-1} (I - b_t k_t k_t^T) + b_t v_t k_t^T, o_t = S_t q_t.
++
++#include "include/batch_headers/common.cl"
++#include "include/batch_headers/sub_group_block_read.cl"
++#include "include/batch_headers/sub_group_block_write.cl"
++#include "include/batch_headers/sub_group_shuffle.cl"
++#include "paged_gated_delta_net_type_utils.cl"
++
++#ifndef FUSE_QK_L2NORM
++#    define FUSE_QK_L2NORM 0
++#endif
++
++#ifndef Q_L2_NORM_EPS
++#    define Q_L2_NORM_EPS 1e-6f
++#endif
++
++#ifndef K_L2_NORM_EPS
++#    define K_L2_NORM_EPS 1e-6f
++#endif
++
++inline float FUNC(l2norm_scale)(float sum, float extra_scale, float eps) {
++    return rsqrt(sum + eps) * extra_scale;
++}
++
++inline float FUNC(sum8)(float8 v) {
++    return v.s0 + v.s1 + v.s2 + v.s3 + v.s4 + v.s5 + v.s6 + v.s7;
++}
++
++inline void FUNC(normalize_kq_128)(float8* b_k, float8* b_q) {
++#if FUSE_QK_L2NORM
++    float k_sum = FUNC(sum8)((*b_k) * (*b_k));
++    k_sum = sub_group_reduce_add(k_sum);
++    const float k_scale = FUNC(l2norm_scale)(k_sum, 1.0f, K_L2_NORM_EPS);
++    *b_k *= k_scale;
++
++    float q_sum = FUNC(sum8)((*b_q) * (*b_q));
++    q_sum = sub_group_reduce_add(q_sum);
++    const float q_scale = FUNC(l2norm_scale)(q_sum, SCALE_FACTOR, Q_L2_NORM_EPS);
++    *b_q *= q_scale;
++#else
++    *b_q *= SCALE_FACTOR;
++#endif
++}
++
++#ifndef K_VEC_SIZE
++#    define K_VEC_SIZE 1
++#endif
++
++#if ((K_HEAD_DIM % 16) != 0) || ((V_HEAD_DIM % 16) != 0)
++#    error "paged_gated_delta_net_short requires K_HEAD_DIM and V_HEAD_DIM divisible by 16"
++#endif
++
++#define K_LANE_ELEMS (K_HEAD_DIM / SUBGROUP_SIZE)
++
++typedef MAKE_VECTOR_TYPE(float, K_VEC_SIZE) K_VEC_TYPE;
++#if (K_VEC_SIZE == 1)
++#    define K_VEC_LOAD_Q(ptr, idx)     PGDN_SDEC(Q_KT, BLOCK_READN(INPUT0_TYPE, 1, (ptr), (idx)))
++#    define K_VEC_LOAD_K(ptr, idx)     PGDN_SDEC(K_KT, BLOCK_READN(INPUT1_TYPE, 1, (ptr), (idx)))
++#    define K_VEC_LOAD_STATE(ptr, idx) PGDN_SDEC(S_KT, BLOCK_READN(INPUT3_TYPE, 1, (ptr), (idx)))
++#    define K_VEC_TO_STATE(vec)        PGDN_SENC(S_KT, vec)
++#    define K_VEC_DOT(a, b)            ((a) * (b))
++#    define K_VEC_SUM_SQ(a)            ((a) * (a))
++#elif (K_VEC_SIZE == 8)
++#    define K_VEC_LOAD_Q(ptr, idx)     PGDN_DECV(Q_KT, BLOCK_READN(INPUT0_TYPE, 8, (ptr), (idx)), 8)
++#    define K_VEC_LOAD_K(ptr, idx)     PGDN_DECV(K_KT, BLOCK_READN(INPUT1_TYPE, 8, (ptr), (idx)), 8)
++#    define K_VEC_LOAD_STATE(ptr, idx) PGDN_DECV(S_KT, BLOCK_READN(INPUT3_TYPE, 8, (ptr), (idx)), 8)
++#    define K_VEC_TO_STATE(vec)        PGDN_ENCV(S_KT, vec, 8)
++#    define K_VEC_DOT(a, b)            FUNC(sum8)((a) * (b))
++#    define K_VEC_SUM_SQ(a)            FUNC(sum8)((a) * (a))
++#else
++#    define K_VEC_LOAD_Q(ptr, idx)     PGDN_DECV(Q_KT, BLOCK_READN(INPUT0_TYPE, K_VEC_SIZE, (ptr), (idx)), K_VEC_SIZE)
++#    define K_VEC_LOAD_K(ptr, idx)     PGDN_DECV(K_KT, BLOCK_READN(INPUT1_TYPE, K_VEC_SIZE, (ptr), (idx)), K_VEC_SIZE)
++#    define K_VEC_LOAD_STATE(ptr, idx) PGDN_DECV(S_KT, BLOCK_READN(INPUT3_TYPE, K_VEC_SIZE, (ptr), (idx)), K_VEC_SIZE)
++#    define K_VEC_TO_STATE(vec)        PGDN_ENCV(S_KT, vec, K_VEC_SIZE)
++#    define K_VEC_DOT(a, b)            dot((a), (b))
++#    define K_VEC_SUM_SQ(a)            dot((a), (a))
++#endif
++
++#define K_VEC_COUNT (K_LANE_ELEMS / K_VEC_SIZE)
++
++REQD_SUB_GROUP_SIZE(SUBGROUP_SIZE)
++KERNEL(paged_gated_delta_net_short)
++(__global INPUT0_TYPE* query,
++ __global INPUT1_TYPE* key,
++ __global INPUT2_TYPE* value,
++ __global INPUT3_TYPE* recurrent_state_table,
++ __global INPUT4_TYPE* gate,
++ __global INPUT5_TYPE* beta,
++ __global INPUT6_TYPE* subsequence_begins,
++ __global INPUT7_TYPE* block_indices,
++ __global INPUT8_TYPE* block_indices_begins,
++ __global INPUT9_TYPE* past_lens,
++ __global INPUT10_TYPE* cache_interval,
++ __global OUTPUT_TYPE* output,
++ int num_sequences,
++ int query_head_offset,
++ int key_head_offset,
++ int value_head_offset,
++ int q_token_stride,
++ int q_head_stride,
++ int k_token_stride,
++ int k_head_stride,
++ int v_token_stride,
++ int v_head_stride) {
++    const int seq = get_global_id(0);
++    const int h = get_global_id(1);
++    const int v_block = get_group_id(2);
++    const int lid = get_sub_group_local_id();
++    const int start_iv = v_block * V_BLOCK_SIZE;
++
++    const int token_begin = subsequence_begins[seq];
++    const int token_end = subsequence_begins[seq + 1];
++    const int block_begin = block_indices_begins[seq];
++    const int past_len = past_lens[seq];
++    const int interval = cache_interval[seq];
++    const int prev_nums = interval > 0 ? past_len % interval : 0;
++
++    const int group_size = V_HEAD_NUM / K_HEAD_NUM;
++    const int hk = h / group_size;
++    const int q_head_base = (hk + query_head_offset) * q_head_stride;
++    const int k_head_base = (hk + key_head_offset) * k_head_stride;
++    const int v_head_base = (h + value_head_offset) * v_head_stride;
++    const int state_stride = K_HEAD_DIM * V_HEAD_DIM;
++
++    K_VEC_TYPE state[V_BLOCK_SIZE][K_VEC_COUNT];
++    K_VEC_TYPE q_norm[K_VEC_COUNT];
++    K_VEC_TYPE k_norm[K_VEC_COUNT];
++
++    const int initial_block_id = block_indices[block_begin];
++    const int initial_block_base = (initial_block_id * V_HEAD_NUM + h) * state_stride;
++
++#pragma unroll
++    for (int v_idx = 0; v_idx < V_BLOCK_SIZE; v_idx++) {
++        int curr_iv = start_iv + v_idx;
++        int base = initial_block_base + curr_iv * K_HEAD_DIM;
++#if (K_VEC_SIZE == 8) && (K_VEC_COUNT == 1)
++        state[v_idx][0] = K_VEC_LOAD_STATE(recurrent_state_table, base);
++#else
++#    pragma unroll
++        for (int kc = 0; kc < K_VEC_COUNT; kc++) {
++            const int k_base = kc * K_VEC_SIZE * SUBGROUP_SIZE;
++            state[v_idx][kc] = K_VEC_LOAD_STATE(recurrent_state_table, base + k_base);
++        }
++#endif
++    }
++
++    int token = token_begin;
++    int slot = 1;
++    int tokens_to_next_boundary = interval > 0 ? (prev_nums > 0 ? (interval - prev_nums) : interval) : (token_end - token_begin);
++    while (token < token_end) {
++        const int chunk_end = min(token + tokens_to_next_boundary, token_end);
++
++        int q_base = token * q_token_stride + q_head_base;
++        int k_base = token * k_token_stride + k_head_base;
++        int v_base = token * v_token_stride + v_head_base;
++        int g_idx = token * V_HEAD_NUM + h;
++
++        for (; token < chunk_end; token++, q_base += q_token_stride, k_base += k_token_stride, v_base += v_token_stride, g_idx += V_HEAD_NUM) {
++#if (K_VEC_SIZE == 8) && (K_VEC_COUNT == 1)
++            q_norm[0] = K_VEC_LOAD_Q(query, q_base);
++            k_norm[0] = K_VEC_LOAD_K(key, k_base);
++            FUNC(normalize_kq_128)(&k_norm[0], &q_norm[0]);
++#else
++            float q_sum_local = 0.0f;
++            float k_sum_local = 0.0f;
++#    pragma unroll
++            for (int kc = 0; kc < K_VEC_COUNT; kc++) {
++                const int offset = kc * K_VEC_SIZE * SUBGROUP_SIZE;
++                q_norm[kc] = K_VEC_LOAD_Q(query, q_base + offset);
++                k_norm[kc] = K_VEC_LOAD_K(key, k_base + offset);
++                q_sum_local += K_VEC_SUM_SQ(q_norm[kc]);
++                k_sum_local += K_VEC_SUM_SQ(k_norm[kc]);
++            }
++
++            float q_scale = SCALE_FACTOR;
++            float k_scale = 1.0f;
++#    if FUSE_QK_L2NORM
++            const float q_sum = sub_group_reduce_add(q_sum_local);
++            const float k_sum = sub_group_reduce_add(k_sum_local);
++
++            q_scale = FUNC(l2norm_scale)(q_sum, SCALE_FACTOR, Q_L2_NORM_EPS);
++            k_scale = FUNC(l2norm_scale)(k_sum, 1.0f, K_L2_NORM_EPS);
++#    endif
++#    pragma unroll
++            for (int kc = 0; kc < K_VEC_COUNT; kc++) {
++                q_norm[kc] *= q_scale;
++                k_norm[kc] *= k_scale;
++            }
++#endif
++
++            const float b_g = exp(PGDN_SDEC(G_KT, gate[g_idx]));
++            const float b_beta = PGDN_SDEC(B_KT, beta[g_idx]);
++
++            float b_v_block[V_BLOCK_SIZE];
++            float h_k_block[V_BLOCK_SIZE];
++            float update_block[V_BLOCK_SIZE];
++            float out_block[V_BLOCK_SIZE];
++#pragma unroll
++            for (int v_idx = 0; v_idx < V_BLOCK_SIZE; v_idx++) {
++                const int curr_iv = start_iv + v_idx;
++                const int v_base_aligned = v_base + (curr_iv & ~(SUBGROUP_SIZE - 1));
++                const int v_lane = curr_iv & (SUBGROUP_SIZE - 1);
++                const float v_val = PGDN_SDEC(V_KT, BLOCK_READN(INPUT2_TYPE, 1, value, v_base_aligned));
++                b_v_block[v_idx] = sub_group_broadcast(v_val, v_lane);
++            }
++
++#pragma unroll
++            for (int v_idx = 0; v_idx < V_BLOCK_SIZE; v_idx++) {
++                float h_k_local = 0.0f;
++#if (K_VEC_SIZE == 8) && (K_VEC_COUNT == 1)
++                state[v_idx][0] *= b_g;
++                h_k_local = FUNC(sum8)(state[v_idx][0] * k_norm[0]);
++#else
++#    pragma unroll
++                for (int kc = 0; kc < K_VEC_COUNT; kc++) {
++                    state[v_idx][kc] *= b_g;
++                    h_k_local += K_VEC_DOT(state[v_idx][kc], k_norm[kc]);
++                }
++#endif
++                h_k_block[v_idx] = sub_group_reduce_add(h_k_local);
++            }
++
++#pragma unroll
++            for (int v_idx = 0; v_idx < V_BLOCK_SIZE; v_idx++) {
++                update_block[v_idx] = (b_v_block[v_idx] - h_k_block[v_idx]) * b_beta;
++            }
++
++#pragma unroll
++            for (int v_idx = 0; v_idx < V_BLOCK_SIZE; v_idx++) {
++                float out_val_local = 0.0f;
++#if (K_VEC_SIZE == 8) && (K_VEC_COUNT == 1)
++                state[v_idx][0] = fma(k_norm[0], update_block[v_idx], state[v_idx][0]);
++                out_val_local = FUNC(sum8)(state[v_idx][0] * q_norm[0]);
++#else
++#    pragma unroll
++                for (int kc = 0; kc < K_VEC_COUNT; kc++) {
++                    state[v_idx][kc] = fma(k_norm[kc], update_block[v_idx], state[v_idx][kc]);
++                    out_val_local += K_VEC_DOT(state[v_idx][kc], q_norm[kc]);
++                }
++#endif
++                out_block[v_idx] = sub_group_reduce_add(out_val_local);
++            }
++
++#pragma unroll
++            for (int v_idx = 0; v_idx < V_BLOCK_SIZE; v_idx++) {
++                int curr_iv = start_iv + v_idx;
++                const float out_val = out_block[v_idx];
++
++                if (lid == 0) {
++                    const int out_offset = (token * V_HEAD_NUM + h) * V_HEAD_DIM + curr_iv;
++                    output[out_offset] = PGDN_SENC(O_KT, out_val);
++                }
++            }
++        }
++
++        const int block_id = block_indices[block_begin + slot];
++        slot++;
++        const int block_base = (block_id * V_HEAD_NUM + h) * state_stride;
++#pragma unroll
++        for (int v_idx = 0; v_idx < V_BLOCK_SIZE; v_idx++) {
++            int curr_iv = start_iv + v_idx;
++            int base = block_base + curr_iv * K_HEAD_DIM;
++#if (K_VEC_SIZE == 8) && (K_VEC_COUNT == 1)
++            BLOCK_WRITEN(INPUT3_TYPE, K_VEC_SIZE, recurrent_state_table, base, K_VEC_TO_STATE(state[v_idx][0]));
++#else
++#    pragma unroll
++            for (int kc = 0; kc < K_VEC_COUNT; kc++) {
++                const int k_base = kc * K_VEC_SIZE * SUBGROUP_SIZE;
++                BLOCK_WRITEN(INPUT3_TYPE, K_VEC_SIZE, recurrent_state_table, base + k_base, K_VEC_TO_STATE(state[v_idx][kc]));
++            }
++#endif
++        }
++
++        if (interval > 0)
++            tokens_to_next_boundary = interval;
++    }
++}
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_gated_delta_net_type_utils.cl b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_gated_delta_net_type_utils.cl
+new file mode 100644
+index 00000000..1ba1d65b
+--- /dev/null
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_gated_delta_net_type_utils.cl
+@@ -0,0 +1,37 @@
++// Copyright (C) 2018-2026 Intel Corporation
++// SPDX-License-Identifier: Apache-2.0
++//
++
++#include "include/batch_headers/bf16_utils.cl"
++
++// bf16 arrives as ushort, so the storage type is selected by (TYPE_SIZE, IS_FP).
++#define PGDN_KT_4_1          F32
++#define PGDN_KT_2_1          F16
++#define PGDN_KT_2_0          BF16
++#define PGDN_KT(size, is_fp) CAT(PGDN_KT_, CAT(size, CAT(_, is_fp)))
++#define Q_KT PGDN_KT(INPUT0_TYPE_SIZE, INPUT0_IS_FP)
++#define K_KT PGDN_KT(INPUT1_TYPE_SIZE, INPUT1_IS_FP)
++#define V_KT PGDN_KT(INPUT2_TYPE_SIZE, INPUT2_IS_FP)
++#define S_KT PGDN_KT(INPUT3_TYPE_SIZE, INPUT3_IS_FP)
++#define G_KT PGDN_KT(INPUT4_TYPE_SIZE, INPUT4_IS_FP)
++#define B_KT PGDN_KT(INPUT5_TYPE_SIZE, INPUT5_IS_FP)
++#define O_KT PGDN_KT(OUTPUT_TYPE_SIZE, OUTPUT_IS_FP)
++
++#define PGDN_DECV_F16(v, n)  CAT(convert_float, n)(v)
++#define PGDN_DECV_F32(v, n)  (v)
++#define PGDN_DECV_BF16(v, n) CONVERT_AS_BFLOAT16_FLOAT(v, n)
++#define PGDN_DECV(KT, v, n)  CAT(PGDN_DECV_, KT)(v, n)
++
++#define PGDN_ENCV_F16(v, n)  CAT(convert_half, n)(v)
++#define PGDN_ENCV_F32(v, n)  (v)
++#define PGDN_ENCV_BF16(v, n) CONVERT_BFLOAT16_AS_USHORT(v, n)
++#define PGDN_ENCV(KT, v, n)  CAT(PGDN_ENCV_, KT)(v, n)
++
++#define PGDN_SDEC_F16(x)  convert_float(x)
++#define PGDN_SDEC_F32(x)  (x)
++#define PGDN_SDEC_BF16(x) _convert_as_bfloat16_float(x)
++#define PGDN_SENC_F16(f)  convert_half(f)
++#define PGDN_SENC_F32(f)  (f)
++#define PGDN_SENC_BF16(f) _convert_bfloat16_as_ushort(f)
++#define PGDN_SDEC(KT, x)  CAT(PGDN_SDEC_, KT)(x)
++#define PGDN_SENC(KT, f)  CAT(PGDN_SENC_, KT)(f)
