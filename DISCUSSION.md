@@ -1,5 +1,4 @@
-<!-- Draft for https://github.com/openvinotoolkit/openvino/discussions — category "Show and tell".
-     Fill the TODO links before posting. -->
+<!-- Posted as https://github.com/openvinotoolkit/openvino/discussions/40307 (category "Show and tell"). -->
 
 **Title:** Qwen3.8-27B INT4 at 11–13 tokens/s on a laptop iGPU (Arc 140T) with MTP + prefix caching
 
@@ -26,7 +25,7 @@ What helped, beyond the upstream MTP support:
   Gated DeltaNet rework (openvino#38793), backported onto 2026.4.1 — a big win at long context;
 - restricting the **MTP draft head to a 65k-token vocabulary subset** (+26 % together with running text
   embeddings on CPU; outputs stay exact since the main model verifies over the full vocabulary) —
-  proposed here: _TODO link issue/PR_;
+  proposed here: https://github.com/openvinotoolkit/openvino.genai/issues/5027 (PR https://github.com/openvinotoolkit/openvino.genai/pull/5029);
 - an **adaptive draft length** (stop drafting when the draft's confidence product < 0.5): +7.8 % overall,
   +24 % on tool-call outputs;
 - an optimized non-paged GatedDeltaNet GPU kernel — https://github.com/openvinotoolkit/openvino/pull/40286.
@@ -41,4 +40,4 @@ Thanks to the OpenVINO and GenAI teams for MTP and the hybrid-model work — hap
 on this hardware if useful.
 
 _AI assistance: I used Claude Code (an AI coding agent) for parts of the implementation and the write-up;
-all numbers above were measured by me on this machine._
+all numbers above were measured on my own machine._

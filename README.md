@@ -104,7 +104,7 @@ generated text slightly.
   tokens this workload actually uses covers 99.87 % of held-out generated tokens, keeps tokens/pass unchanged,
   and the main model still verifies over the full vocabulary (outputs stay exact).
   Script: [`scripts/build_draft_vocab.py`](scripts/build_draft_vocab.py).
-  Upstream proposal: _link to the openvino.genai issue / PR — TODO_.
+  Upstream: issue [openvino.genai#5027](https://github.com/openvinotoolkit/openvino.genai/issues/5027), PR [openvino.genai#5029](https://github.com/openvinotoolkit/openvino.genai/pull/5029) — re-implemented on master as a `mtp_draft_vocab` draft property: **+20.4 % mean decode speed** on Qwen3.5-4B (Arc 140T), bit-exact outputs in f32.
 - **Adaptive draft length**: draft up to 5 tokens but stop as soon as the product of the draft's top-1
   probabilities drops below 0.5. Fixed 3 tokens was the best fixed setting; adaptive adds +7.8 % overall:
   tool-call outputs (very predictable) 10.45 → 12.94 t/s (+24 %), prose 10.29 → 10.08 t/s (−2 %).
@@ -216,8 +216,8 @@ variables instead of properties, debug hooks). Focused upstream PRs are being pr
 ## Links
 
 - OpenVINO: https://github.com/openvinotoolkit/openvino — OpenVINO GenAI: https://github.com/openvinotoolkit/openvino.genai
-- My upstream contributions: [GatedDeltaNet kernel PR #40286](https://github.com/openvinotoolkit/openvino/pull/40286) · _draft vocabulary subset issue/PR — TODO_
-- Discussion: _openvino.genai Show and tell — TODO_
+- My upstream contributions: [GatedDeltaNet kernel PR #40286](https://github.com/openvinotoolkit/openvino/pull/40286) · [MTP draft vocabulary subset — issue #5027 / PR #5029](https://github.com/openvinotoolkit/openvino.genai/pull/5029)
+- Discussion: [openvinotoolkit/openvino — Show and tell #40307](https://github.com/openvinotoolkit/openvino/discussions/40307)
 
 ## License
 
